@@ -321,6 +321,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     runAsUser: 1000,
     runAsGroup: 1000,
     fsGroup: 1000,
+    fsGroupChangePolicy: "OnRootMismatch",
   };
 
   // Build the claude command string for the main container
