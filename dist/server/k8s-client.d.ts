@@ -1,0 +1,37 @@
+import * as k8s from "@kubernetes/client-node";
+/**
+ * Cached self-pod introspection result. Queried once on first execute(),
+ * then reused for all subsequent Job builds so every Job inherits the
+ * Deployment's image, imagePullSecrets, DNS config, and PVC claim.
+ */
+export interface SelfPodSecretVolume {
+    volumeName: string;
+    secretName: string;
+    mountPath: string;
+    defaultMode: number | undefined;
+}
+export interface SelfPodInfo {
+    namespace: string;
+    image: string;
+    imagePullSecrets: Array<{
+        name: string;
+    }>;
+    dnsConfig: k8s.V1PodDNSConfig | undefined;
+    pvcClaimName: string | null;
+    secretVolumes: SelfPodSecretVolume[];
+    /** Env vars inherited from the Deployment container. */
+    inheritedEnv: Record<string, string>;
+}
+export declare function getBatchApi(kubeconfigPath?: string): k8s.BatchV1Api;
+export declare function getCoreApi(kubeconfigPath?: string): k8s.CoreV1Api;
+export declare function getAuthzApi(kubeconfigPath?: string): k8s.AuthorizationV1Api;
+export declare function getLogApi(kubeconfigPath?: string): k8s.Log;
+/**
+ * Query the K8s API for our own pod spec and cache the result.
+ * Extracts image, imagePullSecrets, dnsConfig, PVC claim name,
+ * and environment variables to forward to Job pods.
+ */
+export declare function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodInfo>;
+/** Reset cached state — useful for tests. */
+export declare function resetCache(): void;
+//# sourceMappingURL=k8s-client.d.ts.map
