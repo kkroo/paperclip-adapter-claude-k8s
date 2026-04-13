@@ -13,6 +13,7 @@ import { Writable } from "node:stream";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+const LOG_STREAM_RECONNECT_DELAY_MS = 3_000;
 
 /**
  * Wait for the Job's pod to reach a terminal or running state.
@@ -126,14 +127,15 @@ async function waitForPod(
 }
 
 /**
- * Stream pod logs and accumulate stdout for result parsing.
- * Returns accumulated stdout when the stream ends.
+ * Stream pod logs once via follow. Returns accumulated stdout when the
+ * stream ends (container exit, API disconnect, or abort signal).
  */
-async function streamPodLogs(
+async function streamPodLogsOnce(
   namespace: string,
   podName: string,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
+  sinceSeconds?: number,
 ): Promise<string> {
   const logApi = getLogApi(kubeconfigPath);
   const chunks: string[] = [];
@@ -150,13 +152,57 @@ async function streamPodLogs(
     await logApi.log(namespace, podName, "claude", writable, {
       follow: true,
       pretty: false,
+      ...(sinceSeconds ? { sinceSeconds } : {}),
     });
   } catch {
-    // follow may fail if the container already exited — not fatal,
-    // we'll try a one-shot read below
+    // follow may fail if the container already exited or the API
+    // connection dropped — not fatal, caller decides whether to retry.
   }
 
   return chunks.join("");
+}
+
+/**
+ * Stream pod logs with automatic reconnection. Keeps retrying the log
+ * stream until the stop signal fires (job completed) or the container
+ * exits normally. This handles silent K8s API connection drops that
+ * would otherwise cause the UI to stop receiving real output.
+ */
+async function streamPodLogs(
+  namespace: string,
+  podName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+  stopSignal?: { stopped: boolean },
+): Promise<string> {
+  const allChunks: string[] = [];
+  let attempt = 0;
+  const streamStartedAt = Math.floor(Date.now() / 1000);
+
+  while (!stopSignal?.stopped) {
+    // On reconnect, ask for logs since the stream originally started to
+    // avoid missing output during the reconnect gap.  Duplicates are
+    // tolerable — the UI deduplicates log chunks.
+    const sinceSeconds = attempt > 0
+      ? Math.max(1, Math.floor(Date.now() / 1000) - streamStartedAt + 5)
+      : undefined;
+
+    if (attempt > 0) {
+      await onLog("stdout", `[paperclip] Log stream disconnected — reconnecting (attempt ${attempt})...\n`);
+    }
+
+    const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds);
+    if (result) allChunks.push(result);
+    attempt++;
+
+    // If the job is done or the container exited, no need to reconnect.
+    if (stopSignal?.stopped) break;
+
+    // Brief pause before reconnecting to avoid tight loops.
+    await new Promise((resolve) => setTimeout(resolve, LOG_STREAM_RECONNECT_DELAY_MS));
+  }
+
+  return allChunks.join("");
 }
 
 /**
@@ -372,9 +418,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return onLog(stream, chunk);
     };
 
+    // Shared signal: when job completion resolves, tell the log
+    // streamer to stop reconnecting.
+    const logStopSignal = { stopped: false };
+
     const [logResult, completionResult] = await Promise.allSettled([
-      streamPodLogs(namespace, podName, wrappedOnLog, kubeconfigPath),
-      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath),
+      streamPodLogs(namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal),
+      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then((r) => {
+        logStopSignal.stopped = true;
+        return r;
+      }),
     ]);
 
     if (logResult.status === "fulfilled") {

@@ -4,6 +4,7 @@ import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi } from "./k8s-client
 import { buildJobManifest } from "./job-manifest.js";
 import { Writable } from "node:stream";
 const POLL_INTERVAL_MS = 2000;
+const KEEPALIVE_INTERVAL_MS = 15_000;
 /**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
@@ -270,6 +271,7 @@ export async function execute(ctx) {
     let stdout = "";
     let exitCode = null;
     let jobTimedOut = false;
+    let keepaliveTimer = null;
     try {
         // Wait for pod to be ready for log streaming
         const scheduleTimeoutMs = 120_000; // 2 minutes for scheduling
@@ -294,8 +296,20 @@ export async function execute(ctx) {
         // We also poll the Job status to detect deadline exceeded.
         // 0 = no timeout (run indefinitely, matching claude_local behavior)
         const completionTimeoutMs = timeoutSec > 0 ? (timeoutSec + graceSec) * 1000 : 0;
+        // Keepalive: periodically send a status line via onLog so the
+        // Paperclip server knows the adapter is still alive even when the
+        // pod produces no output (e.g. Claude is in a long thinking phase).
+        let lastLogAt = Date.now();
+        keepaliveTimer = setInterval(() => {
+            const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
+            void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`);
+        }, KEEPALIVE_INTERVAL_MS);
+        const wrappedOnLog = async (stream, chunk) => {
+            lastLogAt = Date.now();
+            return onLog(stream, chunk);
+        };
         const [logResult, completionResult] = await Promise.allSettled([
-            streamPodLogs(namespace, podName, onLog, kubeconfigPath),
+            streamPodLogs(namespace, podName, wrappedOnLog, kubeconfigPath),
             waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath),
         ]);
         if (logResult.status === "fulfilled") {
@@ -319,6 +333,8 @@ export async function execute(ctx) {
         exitCode = await getPodExitCode(namespace, jobName, kubeconfigPath);
     }
     finally {
+        if (keepaliveTimer)
+            clearInterval(keepaliveTimer);
         if (!retainJobs) {
             await cleanupJob(namespace, jobName, onLog, kubeconfigPath);
         }
