@@ -379,6 +379,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let exitCode: number | null = null;
   let jobTimedOut = false;
   let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  // Set when we return a mismatch error so the finally block knows not to
+  // delete a job that is still alive and the UI is waiting on.
+  let skipCleanup = false;
 
   try {
     // Wait for pod to be ready for log streaming
@@ -444,16 +447,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
-    // If the follow stream missed output (container exited quickly), do a
-    // one-shot log read as fallback before the pod is cleaned up.
-    if (!stdout.trim()) {
-      await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
-      stdout = await readPodLogs(namespace, podName, kubeconfigPath);
-      if (stdout.trim()) {
-        await onLog("stdout", stdout);
-      }
-    }
-
     if (completionResult.status === "fulfilled") {
       jobTimedOut = completionResult.value.timedOut;
     } else {
@@ -470,6 +463,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Return an error so the UI knows the run is not done, rather than
         // returning with parsed (potentially incomplete) stdout.
         await onLog("stderr", `[paperclip] Job ${jobName} still not terminal after log/completion mismatch — returning error to keep UI in sync.\n`);
+        skipCleanup = true;
         return {
           exitCode,
           signal: null,
@@ -483,7 +477,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     exitCode = await getPodExitCode(namespace, jobName, kubeconfigPath);
   } finally {
     if (keepaliveTimer) clearInterval(keepaliveTimer);
-    if (!retainJobs) {
+    if (skipCleanup) {
+      await onLog("stdout", `[paperclip] Retaining job ${jobName} (state mismatch — UI is waiting on it)\n`);
+    } else if (!retainJobs) {
       await cleanupJob(namespace, jobName, onLog, kubeconfigPath);
     } else {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
