@@ -20,6 +20,7 @@ describe("listK8sModels", () => {
 
   it("returns direct API models by default", async () => {
     const models = await listK8sModels();
+    expect(models.some((m) => m.id === "claude-opus-4-7")).toBe(true);
     expect(models.some((m) => m.id === "claude-opus-4-6")).toBe(true);
     expect(models.every((m) => !m.id.includes("anthropic."))).toBe(true);
   });
@@ -46,6 +47,6 @@ describe("listK8sModels", () => {
   it("ignores blank ANTHROPIC_BEDROCK_BASE_URL", async () => {
     process.env.ANTHROPIC_BEDROCK_BASE_URL = "   ";
     const models = await listK8sModels();
-    expect(models.some((m) => m.id === "claude-opus-4-6")).toBe(true);
+    expect(models.some((m) => m.id === "claude-opus-4-7")).toBe(true);
   });
 });
