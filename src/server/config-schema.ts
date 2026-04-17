@@ -44,6 +44,12 @@ export function getConfigSchema(): AdapterConfigSchema {
     // Kubernetes
     {
       type: "text",
+      key: "serviceAccountName",
+      label: "Service Account",
+      hint: "Service Account name for Job pods. Defaults to the cluster default.",
+    },
+    {
+      type: "text",
       key: "namespace",
       label: "Namespace",
       hint: "Kubernetes namespace for Jobs. Defaults to the Deployment namespace.",
