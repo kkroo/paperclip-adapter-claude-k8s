@@ -14,6 +14,7 @@ import { Writable } from "node:stream";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_STREAM_RECONNECT_DELAY_MS = 3_000;
+const MAX_LOG_RECONNECT_ATTEMPTS = 50;
 
 /**
  * Wait for the Job's pod to reach a terminal or running state.
@@ -167,6 +168,9 @@ async function streamPodLogsOnce(
  * stream until the stop signal fires (job completed) or the container
  * exits normally. This handles silent K8s API connection drops that
  * would otherwise cause the UI to stop receiving real output.
+ *
+ * Capped at MAX_LOG_RECONNECT_ATTEMPTS to prevent infinite reconnect
+ * loops during sustained API partitions.
  */
 async function streamPodLogs(
   namespace: string,
@@ -177,22 +181,40 @@ async function streamPodLogs(
 ): Promise<string> {
   const allChunks: string[] = [];
   let attempt = 0;
-  const streamStartedAt = Math.floor(Date.now() / 1000);
+  // Track the timestamp of the last successfully received log line so
+  // reconnects use a tight window instead of an ever-growing one anchored
+  // at stream start.  This is the primary fix for FAR-105 duplicative logs.
+  let lastLogReceivedAt = Math.floor(Date.now() / 1000);
 
   while (!stopSignal?.stopped) {
-    // On reconnect, ask for logs since the stream originally started to
-    // avoid missing output during the reconnect gap.  Duplicates are
-    // tolerable — the UI deduplicates log chunks.
+    if (attempt >= MAX_LOG_RECONNECT_ATTEMPTS) {
+      await onLog("stderr", `[paperclip] Log stream: max reconnect attempts (${MAX_LOG_RECONNECT_ATTEMPTS}) reached — giving up.\n`);
+      break;
+    }
+
+    // On reconnect, ask for logs since the last received line (+5s buffer)
+    // instead of since stream start.  This keeps the window tight and
+    // avoids ever-growing duplicate output.
     const sinceSeconds = attempt > 0
-      ? Math.max(1, Math.floor(Date.now() / 1000) - streamStartedAt + 5)
+      ? Math.max(1, Math.floor(Date.now() / 1000) - lastLogReceivedAt + 5)
       : undefined;
 
     if (attempt > 0) {
-      await onLog("stdout", `[paperclip] Log stream disconnected — reconnecting (attempt ${attempt})...\n`);
+      await onLog("stdout", `[paperclip] Log stream disconnected — reconnecting (attempt ${attempt}/${MAX_LOG_RECONNECT_ATTEMPTS})...\n`);
     }
 
+    const preStreamTs = Math.floor(Date.now() / 1000);
     const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds);
-    if (result) allChunks.push(result);
+    if (result) {
+      allChunks.push(result);
+      // Update last-received timestamp to now (the stream just ended,
+      // so any log lines in `result` were received up to this moment).
+      lastLogReceivedAt = Math.floor(Date.now() / 1000);
+    } else if (attempt === 0) {
+      // First attempt returned nothing — update timestamp so reconnect
+      // window stays reasonable.
+      lastLogReceivedAt = preStreamTs;
+    }
     attempt++;
 
     // If the job is done or the container exited, no need to reconnect.
@@ -356,12 +378,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
     }
-  } catch {
-    // If we can't check, proceed — the heartbeat service enforces concurrency too
+  } catch (err: unknown) {
+    // If we can't list jobs, fail closed — the K8s concurrency guard is the
+    // only thing preventing zombie Jobs on a shared PVC from corrupting
+    // sessions.  404 (namespace not found) is treated as a hard failure;
+    // other errors (5xx, network) are also surfaced.
+    const msg = err instanceof Error ? err.message : String(err);
+    await onLog("stderr", `[paperclip] Concurrency guard failed: unable to list jobs: ${msg}\n`);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: `Concurrency guard unreachable: ${msg}`,
+      errorCode: "k8s_concurrency_guard_unreachable",
+    };
   }
 
   // Build Job manifest
-  const { job, jobName, namespace, prompt, claudeArgs, promptMetrics } = buildJobManifest({
+  const { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret } = buildJobManifest({
     ctx,
     selfPod,
   });
@@ -382,6 +416,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(promptMetrics ? { promptMetrics } : {}),
       context: ctx.context,
     } as Parameters<typeof onMeta>[0]);
+  }
+
+  // If the prompt is large, create a Secret to hold it (avoids the ~1 MiB
+  // PodSpec limit).  The Secret is cleaned up in the finally block.
+  const coreApi = getCoreApi(kubeconfigPath);
+  if (promptSecret) {
+    try {
+      await coreApi.createNamespacedSecret({
+        namespace: promptSecret.namespace,
+        body: {
+          apiVersion: "v1",
+          kind: "Secret",
+          metadata: {
+            name: promptSecret.name,
+            namespace: promptSecret.namespace,
+            labels: {
+              "app.kubernetes.io/managed-by": "paperclip",
+              "paperclip.io/adapter-type": "claude_k8s",
+              "paperclip.io/run-id": runId,
+            },
+          },
+          stringData: promptSecret.data,
+        },
+      });
+      await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Failed to create prompt Secret: ${msg}`,
+        errorCode: "k8s_prompt_secret_create_failed",
+      };
+    }
   }
 
   // Create the Job
@@ -486,21 +556,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             keepaliveJobTerminal = true;
             return;
           }
-        } catch {
-          // Job may have been deleted out from under us, or the API call
-          // transiently failed.  Either way, do not refresh updatedAt —
-          // either the Job really is gone, or the next tick will re-check.
-          keepaliveJobTerminal = true;
+        } catch (err: unknown) {
+          // Only treat 404 (Job deleted) as terminal.  Transient 5xx or
+          // connection resets should NOT permanently disable the keepalive —
+          // the next tick will re-check and the reaper uses the staleness
+          // window as a safety net.
+          const statusCode = (err as { response?: { statusCode?: number } })?.response?.statusCode
+            ?? (err as { statusCode?: number })?.statusCode;
+          if (statusCode === 404) {
+            keepaliveJobTerminal = true;
+            return;
+          }
+          // Log transient errors but leave keepaliveJobTerminal false so
+          // the next tick retries.
+          const msg = err instanceof Error ? err.message : String(err);
+          void onLog("stderr", `[paperclip] keepalive: transient error checking job status: ${msg}\n`).catch(() => {});
           return;
         }
 
         const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
-        void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`);
+        void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`).catch(() => {});
 
-        // Refresh updatedAt every ~4 minutes (16 ticks × 15s) to stay
-        // well within the 5-minute reaper staleness window.
+        // Refresh updatedAt every ~3 minutes (12 ticks × 15s = 180s) to
+        // stay well within the 5-minute reaper staleness window.  Also
+        // fire on tick 1 for an early safety margin after job start.
         keepaliveTick++;
-        if (ctx.onSpawn && keepaliveTick % 16 === 0) {
+        if (ctx.onSpawn && (keepaliveTick === 1 || keepaliveTick % 12 === 0)) {
           void ctx.onSpawn({ pid: -1, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
         }
       })();
@@ -550,11 +631,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } else {
       // waitForJobCompletion threw — re-check job state to avoid returning
       // while the job is still running (which would cause UI staleness and
-      // concurrency errors on retry).
+      // concurrency errors on retry).  Use a bounded timeout (60s) so we
+      // don't hang the heartbeat indefinitely if the K8s API is degraded.
       jobTimedOut = false;
-      const actualState = await waitForJobCompletion(namespace, jobName, 0, kubeconfigPath);
+      const RECHECK_TIMEOUT_MS = 60_000;
+      const actualState = await waitForJobCompletion(namespace, jobName, RECHECK_TIMEOUT_MS, kubeconfigPath);
       if (actualState.timedOut) {
-        // Truly a timeout after re-check — treat as timed out.
+        // Re-check itself timed out — the job may still be running.
+        // Return an error so the UI knows the run is not done.
         jobTimedOut = true;
       } else if (!actualState.succeeded) {
         // Job still not terminal — the completion error was likely transient.
@@ -581,6 +665,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await cleanupJob(namespace, jobName, onLog, kubeconfigPath);
     } else {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
+    }
+    // Clean up prompt Secret if one was created
+    if (promptSecret) {
+      try {
+        await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+      } catch {
+        // Best-effort cleanup — TTL or manual deletion will catch stragglers
+      }
     }
   }
 
