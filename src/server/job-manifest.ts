@@ -359,7 +359,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               name: "write-prompt",
               image: "busybox:1.36",
               imagePullPolicy: "IfNotPresent",
-              command: ["sh", "-c", "echo \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
+              command: ["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
               env: [{ name: "PROMPT_CONTENT", value: prompt }],
               volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
               securityContext,

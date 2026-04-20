@@ -181,7 +181,7 @@ describe("buildJobManifest", () => {
     it("write-prompt writes PROMPT_CONTENT to /tmp/prompt/prompt.txt", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
-      expect(init?.command).toEqual(["sh", "-c", "echo \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"]);
+      expect(init?.command).toEqual(["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"]);
     });
 
     it("write-prompt mounts prompt volume", () => {
