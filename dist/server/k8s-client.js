@@ -97,13 +97,22 @@ export async function getSelfPodInfo(kubeconfigPath) {
     // Collect env vars from the pod spec's container definition.
     // Agent config env (set in buildEnvVars) will override these.
     const inheritedEnv = {};
+    const inheritedEnvValueFrom = [];
     for (const envItem of mainContainer.env ?? []) {
         if (!envItem.name)
             continue;
-        const value = envItem.value ?? "";
-        if (value)
-            inheritedEnv[envItem.name] = value;
+        if (envItem.valueFrom) {
+            // Preserve valueFrom entries (secretKeyRef, configMapKeyRef, fieldRef, etc.)
+            inheritedEnvValueFrom.push({ name: envItem.name, valueFrom: envItem.valueFrom });
+        }
+        else {
+            const value = envItem.value ?? "";
+            if (value)
+                inheritedEnv[envItem.name] = value;
+        }
     }
+    // Capture envFrom sources (secretRef, configMapRef) from the container spec
+    const inheritedEnvFrom = mainContainer.envFrom ?? [];
     cachedSelfPod = {
         namespace,
         image: mainContainer.image,
@@ -114,6 +123,8 @@ export async function getSelfPodInfo(kubeconfigPath) {
         pvcClaimName,
         secretVolumes,
         inheritedEnv,
+        inheritedEnvValueFrom,
+        inheritedEnvFrom,
     };
     return cachedSelfPod;
 }

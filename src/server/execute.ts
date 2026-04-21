@@ -493,7 +493,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // stale-run reaper (reapOrphanedRuns) uses to decide liveness.
       if (ctx.onSpawn) {
         await ctx.onSpawn({
-          pid: -1,              // no local process; sentinel for K8s Job
+          pid: process.pid,     // Paperclip server PID — always alive while adapter runs in-process
           processGroupId: null,
           startedAt: new Date().toISOString(),
         });
@@ -582,7 +582,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // fire on tick 1 for an early safety margin after job start.
         keepaliveTick++;
         if (ctx.onSpawn && (keepaliveTick === 1 || keepaliveTick % 12 === 0)) {
-          void ctx.onSpawn({ pid: -1, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
+          void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => {});
         }
       })();
     }, KEEPALIVE_INTERVAL_MS);

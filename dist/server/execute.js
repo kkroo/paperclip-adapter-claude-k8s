@@ -6,6 +6,7 @@ import { Writable } from "node:stream";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_STREAM_RECONNECT_DELAY_MS = 3_000;
+const MAX_LOG_RECONNECT_ATTEMPTS = 50;
 /**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
@@ -131,24 +132,44 @@ async function streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinc
  * stream until the stop signal fires (job completed) or the container
  * exits normally. This handles silent K8s API connection drops that
  * would otherwise cause the UI to stop receiving real output.
+ *
+ * Capped at MAX_LOG_RECONNECT_ATTEMPTS to prevent infinite reconnect
+ * loops during sustained API partitions.
  */
 async function streamPodLogs(namespace, podName, onLog, kubeconfigPath, stopSignal) {
     const allChunks = [];
     let attempt = 0;
-    const streamStartedAt = Math.floor(Date.now() / 1000);
+    // Track the timestamp of the last successfully received log line so
+    // reconnects use a tight window instead of an ever-growing one anchored
+    // at stream start.  This is the primary fix for FAR-105 duplicative logs.
+    let lastLogReceivedAt = Math.floor(Date.now() / 1000);
     while (!stopSignal?.stopped) {
-        // On reconnect, ask for logs since the stream originally started to
-        // avoid missing output during the reconnect gap.  Duplicates are
-        // tolerable — the UI deduplicates log chunks.
+        if (attempt >= MAX_LOG_RECONNECT_ATTEMPTS) {
+            await onLog("stderr", `[paperclip] Log stream: max reconnect attempts (${MAX_LOG_RECONNECT_ATTEMPTS}) reached — giving up.\n`);
+            break;
+        }
+        // On reconnect, ask for logs since the last received line (+5s buffer)
+        // instead of since stream start.  This keeps the window tight and
+        // avoids ever-growing duplicate output.
         const sinceSeconds = attempt > 0
-            ? Math.max(1, Math.floor(Date.now() / 1000) - streamStartedAt + 5)
+            ? Math.max(1, Math.floor(Date.now() / 1000) - lastLogReceivedAt + 5)
             : undefined;
         if (attempt > 0) {
-            await onLog("stdout", `[paperclip] Log stream disconnected — reconnecting (attempt ${attempt})...\n`);
+            await onLog("stdout", `[paperclip] Log stream disconnected — reconnecting (attempt ${attempt}/${MAX_LOG_RECONNECT_ATTEMPTS})...\n`);
         }
+        const preStreamTs = Math.floor(Date.now() / 1000);
         const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds);
-        if (result)
+        if (result) {
             allChunks.push(result);
+            // Update last-received timestamp to now (the stream just ended,
+            // so any log lines in `result` were received up to this moment).
+            lastLogReceivedAt = Math.floor(Date.now() / 1000);
+        }
+        else if (attempt === 0) {
+            // First attempt returned nothing — update timestamp so reconnect
+            // window stays reasonable.
+            lastLogReceivedAt = preStreamTs;
+        }
         attempt++;
         // If the job is done or the container exited, no need to reconnect.
         if (stopSignal?.stopped)
@@ -237,7 +258,10 @@ export async function execute(ctx) {
     const graceSec = asNumber(config.graceSec, 60);
     const retainJobs = asBoolean(config.retainJobs, false);
     const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
-    // Guard: claude_k8s must not run concurrently for the same agent (shared PVC/session)
+    // Guard: claude_k8s must not run concurrently for the same agent (shared PVC/session).
+    // After a server restart, orphaned K8s Jobs from previous (now-failed) runs may
+    // still be running.  We detect those by comparing the Job's run-id label against
+    // the current runId and clean them up so this execution can proceed.
     const agentId = ctx.agent.id;
     const selfPod = await getSelfPodInfo(kubeconfigPath);
     const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
@@ -249,22 +273,52 @@ export async function execute(ctx) {
         });
         const running = existing.items.filter((j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"));
         if (running.length > 0) {
-            const names = running.map((j) => j.metadata?.name).join(", ");
-            await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
-            return {
-                exitCode: null,
-                signal: null,
-                timedOut: false,
-                errorMessage: `Concurrent run blocked: Job ${names} is still running for this agent`,
-                errorCode: "k8s_concurrent_run_blocked",
-            };
+            // Separate orphaned jobs (from a previous server-side run) from truly
+            // concurrent jobs (same runId — shouldn't happen but guard defensively).
+            const orphaned = running.filter((j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") !== runId);
+            const samRun = running.filter((j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") === runId);
+            if (orphaned.length > 0) {
+                const orphanNames = orphaned.map((j) => j.metadata?.name).join(", ");
+                await onLog("stdout", `[paperclip] Cleaning up ${orphaned.length} orphaned K8s Job(s) from previous run(s): ${orphanNames}\n`);
+                for (const j of orphaned) {
+                    const name = j.metadata?.name;
+                    if (name) {
+                        await cleanupJob(guardNamespace, name, onLog, kubeconfigPath);
+                    }
+                }
+            }
+            // If there are still running Jobs that belong to THIS run (shouldn't happen
+            // since we haven't created the Job yet), block execution.
+            if (samRun.length > 0) {
+                const names = samRun.map((j) => j.metadata?.name).join(", ");
+                await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this run: ${names}\n`);
+                return {
+                    exitCode: null,
+                    signal: null,
+                    timedOut: false,
+                    errorMessage: `Concurrent run blocked: Job ${names} is still running for this agent`,
+                    errorCode: "k8s_concurrent_run_blocked",
+                };
+            }
         }
     }
-    catch {
-        // If we can't check, proceed — the heartbeat service enforces concurrency too
+    catch (err) {
+        // If we can't list jobs, fail closed — the K8s concurrency guard is the
+        // only thing preventing zombie Jobs on a shared PVC from corrupting
+        // sessions.  404 (namespace not found) is treated as a hard failure;
+        // other errors (5xx, network) are also surfaced.
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Concurrency guard failed: unable to list jobs: ${msg}\n`);
+        return {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Concurrency guard unreachable: ${msg}`,
+            errorCode: "k8s_concurrency_guard_unreachable",
+        };
     }
     // Build Job manifest
-    const { job, jobName, namespace, prompt, claudeArgs, promptMetrics } = buildJobManifest({
+    const { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret } = buildJobManifest({
         ctx,
         selfPod,
     });
@@ -284,6 +338,42 @@ export async function execute(ctx) {
             ...(promptMetrics ? { promptMetrics } : {}),
             context: ctx.context,
         });
+    }
+    // If the prompt is large, create a Secret to hold it (avoids the ~1 MiB
+    // PodSpec limit).  The Secret is cleaned up in the finally block.
+    const coreApi = getCoreApi(kubeconfigPath);
+    if (promptSecret) {
+        try {
+            await coreApi.createNamespacedSecret({
+                namespace: promptSecret.namespace,
+                body: {
+                    apiVersion: "v1",
+                    kind: "Secret",
+                    metadata: {
+                        name: promptSecret.name,
+                        namespace: promptSecret.namespace,
+                        labels: {
+                            "app.kubernetes.io/managed-by": "paperclip",
+                            "paperclip.io/adapter-type": "claude_k8s",
+                            "paperclip.io/run-id": runId,
+                        },
+                    },
+                    stringData: promptSecret.data,
+                },
+            });
+            await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
+            return {
+                exitCode: null,
+                signal: null,
+                timedOut: false,
+                errorMessage: `Failed to create prompt Secret: ${msg}`,
+                errorCode: "k8s_prompt_secret_create_failed",
+            };
+        }
     }
     // Create the Job
     const batchApi = getBatchApi(kubeconfigPath);
@@ -306,6 +396,9 @@ export async function execute(ctx) {
     let exitCode = null;
     let jobTimedOut = false;
     let keepaliveTimer = null;
+    // Set when we return a mismatch error so the finally block knows not to
+    // delete a job that is still alive and the UI is waiting on.
+    let skipCleanup = false;
     try {
         // Wait for pod to be ready for log streaming
         const scheduleTimeoutMs = 120_000; // 2 minutes for scheduling
@@ -313,6 +406,16 @@ export async function execute(ctx) {
         try {
             podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
             await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
+            // Notify the server that execution has started.  This sets
+            // processStartedAt and refreshes updatedAt in the DB, which the
+            // stale-run reaper (reapOrphanedRuns) uses to decide liveness.
+            if (ctx.onSpawn) {
+                await ctx.onSpawn({
+                    pid: process.pid, // Paperclip server PID — always alive while adapter runs in-process
+                    processGroupId: null,
+                    startedAt: new Date().toISOString(),
+                });
+            }
         }
         catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -333,10 +436,69 @@ export async function execute(ctx) {
         // Keepalive: periodically send a status line via onLog so the
         // Paperclip server knows the adapter is still alive even when the
         // pod produces no output (e.g. Claude is in a long thinking phase).
+        //
+        // IMPORTANT: onLog alone does NOT update the run's updatedAt in the
+        // DB — it only appends to the log store and publishes SSE events.
+        // The stale-run reaper checks updatedAt, so we must also call
+        // onSpawn periodically to refresh it.  Without this, multi-instance
+        // deployments can reap a live run from another server instance
+        // after the 5-minute staleness window.
+        //
+        // BUT: the keepalive must NEVER refresh updatedAt if the underlying
+        // K8s Job is already terminal.  Otherwise, if execute() stalls after
+        // the pod finishes (e.g. a slow K8s API call, a hung log stream
+        // drain, or a Job whose Complete condition lags pod termination),
+        // we would keep the run marked "alive" indefinitely while the pod
+        // is actually gone — the exact "UI thinks jobs are running when
+        // they are not" bug.  We verify Job liveness every tick and stop
+        // refreshing as soon as the Job reaches a terminal state; if
+        // execute() is truly stuck, the reaper will then catch it within
+        // the normal 5-minute staleness window.
         let lastLogAt = Date.now();
+        let keepaliveTick = 0;
+        let keepaliveJobTerminal = false;
         keepaliveTimer = setInterval(() => {
-            const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
-            void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`);
+            // Fire-and-forget the async work; setInterval callbacks must be
+            // synchronous or the timer will drift.
+            void (async () => {
+                if (keepaliveJobTerminal)
+                    return;
+                // Verify the Job is still alive before announcing or refreshing.
+                try {
+                    const job = await batchApi.readNamespacedJob({ name: jobName, namespace });
+                    const terminal = job.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True");
+                    if (terminal) {
+                        keepaliveJobTerminal = true;
+                        return;
+                    }
+                }
+                catch (err) {
+                    // Only treat 404 (Job deleted) as terminal.  Transient 5xx or
+                    // connection resets should NOT permanently disable the keepalive —
+                    // the next tick will re-check and the reaper uses the staleness
+                    // window as a safety net.
+                    const statusCode = err?.response?.statusCode
+                        ?? err?.statusCode;
+                    if (statusCode === 404) {
+                        keepaliveJobTerminal = true;
+                        return;
+                    }
+                    // Log transient errors but leave keepaliveJobTerminal false so
+                    // the next tick retries.
+                    const msg = err instanceof Error ? err.message : String(err);
+                    void onLog("stderr", `[paperclip] keepalive: transient error checking job status: ${msg}\n`).catch(() => { });
+                    return;
+                }
+                const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
+                void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`).catch(() => { });
+                // Refresh updatedAt every ~3 minutes (12 ticks × 15s = 180s) to
+                // stay well within the 5-minute reaper staleness window.  Also
+                // fire on tick 1 for an early safety margin after job start.
+                keepaliveTick++;
+                if (ctx.onSpawn && (keepaliveTick === 1 || keepaliveTick % 12 === 0)) {
+                    void ctx.onSpawn({ pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() }).catch(() => { });
+                }
+            })();
         }, KEEPALIVE_INTERVAL_MS);
         const wrappedOnLog = async (stream, chunk) => {
             lastLogAt = Date.now();
@@ -352,17 +514,16 @@ export async function execute(ctx) {
                 return r;
             }),
         ]);
+        // Stop the keepalive immediately once the job has reached a terminal
+        // state — do not wait for the finally block.  Any K8s API call or
+        // cleanup that happens after this point should not keep the run
+        // marked "alive" in the DB via onSpawn refreshes.
+        if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+        }
         if (logResult.status === "fulfilled") {
             stdout = logResult.value;
-        }
-        // If the follow stream missed output (container exited quickly), do a
-        // one-shot log read as fallback before the pod is cleaned up.
-        if (!stdout.trim()) {
-            await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
-            stdout = await readPodLogs(namespace, podName, kubeconfigPath);
-            if (stdout.trim()) {
-                await onLog("stdout", stdout);
-            }
         }
         // If the follow stream missed output (container exited quickly), do a
         // one-shot log read as fallback before the pod is cleaned up.
@@ -379,11 +540,14 @@ export async function execute(ctx) {
         else {
             // waitForJobCompletion threw — re-check job state to avoid returning
             // while the job is still running (which would cause UI staleness and
-            // concurrency errors on retry).
+            // concurrency errors on retry).  Use a bounded timeout (60s) so we
+            // don't hang the heartbeat indefinitely if the K8s API is degraded.
             jobTimedOut = false;
-            const actualState = await waitForJobCompletion(namespace, jobName, 0, kubeconfigPath);
+            const RECHECK_TIMEOUT_MS = 60_000;
+            const actualState = await waitForJobCompletion(namespace, jobName, RECHECK_TIMEOUT_MS, kubeconfigPath);
             if (actualState.timedOut) {
-                // Truly a timeout after re-check — treat as timed out.
+                // Re-check itself timed out — the job may still be running.
+                // Return an error so the UI knows the run is not done.
                 jobTimedOut = true;
             }
             else if (!actualState.succeeded) {
@@ -391,6 +555,7 @@ export async function execute(ctx) {
                 // Return an error so the UI knows the run is not done, rather than
                 // returning with parsed (potentially incomplete) stdout.
                 await onLog("stderr", `[paperclip] Job ${jobName} still not terminal after log/completion mismatch — returning error to keep UI in sync.\n`);
+                skipCleanup = true;
                 return {
                     exitCode,
                     signal: null,
@@ -405,11 +570,23 @@ export async function execute(ctx) {
     finally {
         if (keepaliveTimer)
             clearInterval(keepaliveTimer);
-        if (!retainJobs) {
+        if (skipCleanup) {
+            await onLog("stdout", `[paperclip] Retaining job ${jobName} (state mismatch — UI is waiting on it)\n`);
+        }
+        else if (!retainJobs) {
             await cleanupJob(namespace, jobName, onLog, kubeconfigPath);
         }
         else {
             await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
+        }
+        // Clean up prompt Secret if one was created
+        if (promptSecret) {
+            try {
+                await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+            }
+            catch {
+                // Best-effort cleanup — TTL or manual deletion will catch stragglers
+            }
         }
     }
     // Parse Claude output (reuse claude_local parsing)

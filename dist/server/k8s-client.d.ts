@@ -19,8 +19,12 @@ export interface SelfPodInfo {
     dnsConfig: k8s.V1PodDNSConfig | undefined;
     pvcClaimName: string | null;
     secretVolumes: SelfPodSecretVolume[];
-    /** Env vars inherited from the Deployment container. */
+    /** Env vars inherited from the Deployment container (literal name/value pairs). */
     inheritedEnv: Record<string, string>;
+    /** Env vars with valueFrom (secretKeyRef, configMapKeyRef, etc.) from the Deployment container. */
+    inheritedEnvValueFrom: k8s.V1EnvVar[];
+    /** envFrom sources (secretRef, configMapRef) from the Deployment container. */
+    inheritedEnvFrom: k8s.V1EnvFromSource[];
 }
 export declare function getBatchApi(kubeconfigPath?: string): k8s.BatchV1Api;
 export declare function getCoreApi(kubeconfigPath?: string): k8s.CoreV1Api;
