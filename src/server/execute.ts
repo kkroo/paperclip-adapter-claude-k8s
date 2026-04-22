@@ -650,6 +650,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
+    // Second fallback: if we got some output but it contains no result event,
+    // the follow stream may have raced with a fast container exit (capturing
+    // only the init line before the connection dropped).  A one-shot read of
+    // the full log is more reliable for already-terminated containers and may
+    // return the complete output.
+    if (stdout.trim() && !parseClaudeStreamJson(stdout).resultJson) {
+      const fullLogs = await readPodLogs(namespace, podName, kubeconfigPath);
+      if (fullLogs && fullLogs.length > stdout.length) {
+        await onLog("stdout", `[paperclip] Log stream captured partial output — supplemental one-shot read returned more content.\n`);
+        stdout = fullLogs;
+      }
+    }
+
     if (completionResult.status === "fulfilled") {
       jobTimedOut = completionResult.value.timedOut;
       if (completionResult.value.jobGone) {
@@ -739,16 +752,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (!parsed) {
-    const stderrLine = stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
+    // Find the first stdout line that is NOT a system/init event.
+    // Using the system/init JSON blob as the error message produces a huge,
+    // unreadable error in the UI.  Skip those and use the first real content line.
+    const firstContentLine = stdout.split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => {
+        if (!l) return false;
+        try {
+          const obj = JSON.parse(l);
+          if (typeof obj === "object" && obj !== null && (obj as Record<string, unknown>).type === "system") return false;
+        } catch {
+          // not JSON — treat as content
+        }
+        return true;
+      }) ?? "";
+
+    // If we got an init event but nothing else, give a specific message that
+    // names the model so it is easier to diagnose (e.g. unsupported model,
+    // missing API credentials).
+    const initOnlyOutput = stdout.trim() !== "" && parsedStream.model !== "" && !firstContentLine;
+    const modelHint = parsedStream.model ? ` (model: ${parsedStream.model})` : "";
+
     return {
       exitCode,
       signal: null,
       timedOut: false,
       errorMessage: exitCode === 0
         ? "Failed to parse Claude JSON output"
-        : stderrLine
-          ? `Claude exited with code ${exitCode ?? -1}: ${stderrLine}`
-          : `Claude exited with code ${exitCode ?? -1}`,
+        : initOnlyOutput
+          ? `Claude started but did not produce a result${modelHint} — check API credentials, model support, and adapter config`
+          : firstContentLine
+            ? `Claude exited with code ${exitCode ?? -1}: ${firstContentLine}`
+            : `Claude exited with code ${exitCode ?? -1}`,
       resultJson: { stdout },
     };
   }
