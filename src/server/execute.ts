@@ -19,14 +19,54 @@ const MAX_LOG_RECONNECT_ATTEMPTS = 50;
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
  * Works for both v0.x (response.statusCode) and v1.0+ (response.status, message).
+ * Exported for unit tests.
  */
-function isK8s404(err: unknown): boolean {
+export function isK8s404(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const e = err as unknown as Record<string, unknown>;
   const resp = e.response as Record<string, unknown> | undefined;
   if (resp?.statusCode === 404 || resp?.status === 404) return true;
   if (e.statusCode === 404) return true;
   return /HTTP-Code:\s*404\b/.test(err.message);
+}
+
+/**
+ * Build the error message when Claude's stdout contains no result event.
+ * Skips system/init event lines so the UI doesn't display the raw init JSON.
+ * Exported for unit tests.
+ */
+export function buildPartialRunError(
+  exitCode: number | null,
+  model: string,
+  stdout: string,
+): string {
+  if (exitCode === 0) return "Failed to parse Claude JSON output";
+
+  // Walk stdout lines, skip system events, return the first real content line.
+  const firstContentLine = stdout.split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => {
+      if (!l) return false;
+      try {
+        const obj = JSON.parse(l);
+        if (typeof obj === "object" && obj !== null && (obj as Record<string, unknown>).type === "system") return false;
+      } catch {
+        // not JSON — treat as content
+      }
+      return true;
+    }) ?? "";
+
+  // If we only have system/init events and nothing else, surface the model
+  // name so the operator can diagnose missing credentials or unsupported model.
+  const initOnlyOutput = stdout.trim() !== "" && model !== "" && !firstContentLine;
+  if (initOnlyOutput) {
+    const modelHint = model ? ` (model: ${model})` : "";
+    return `Claude started but did not produce a result${modelHint} — check API credentials, model support, and adapter config`;
+  }
+
+  return firstContentLine
+    ? `Claude exited with code ${exitCode ?? -1}: ${firstContentLine}`
+    : `Claude exited with code ${exitCode ?? -1}`;
 }
 
 /**
@@ -640,13 +680,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdout = logResult.value;
     }
 
-    // If the follow stream missed output (container exited quickly), do a
-    // one-shot log read as fallback before the pod is cleaned up.
-    if (!stdout.trim()) {
-      await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
-      stdout = await readPodLogs(namespace, podName, kubeconfigPath);
-      if (stdout.trim()) {
+    // One-shot log fallback: handles two failure modes with a single read.
+    // Mode 1 — empty stream: the follow stream returned nothing (fast exit before connection).
+    // Mode 2 — partial stream: we have some output but no result event (follow stream raced
+    //   with container exit and captured only the init line before the connection dropped).
+    // A one-shot readPodLogs is more reliable for already-terminated containers and reads
+    // from the beginning of the log, giving us the full output.
+    // We use a cheap string scan for the result-event guard (avoids a full JSON parse here;
+    // the authoritative parse happens once below after all fallbacks complete).
+    const hasResultEvent = stdout.includes('"type":"result"');
+    const needsOneShot = !stdout.trim() || (stdout.trim() && !hasResultEvent);
+    if (needsOneShot) {
+      if (!stdout.trim()) {
+        await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
+      }
+      const oneShotLogs = await readPodLogs(namespace, podName, kubeconfigPath);
+      if (!stdout.trim() && oneShotLogs.trim()) {
+        stdout = oneShotLogs;
         await onLog("stdout", stdout);
+      } else if (oneShotLogs && oneShotLogs.length > stdout.length) {
+        await onLog("stdout", `[paperclip] Log stream captured partial output — supplemental one-shot read returned more content.\n`);
+        stdout = oneShotLogs;
       }
     }
 
@@ -739,16 +793,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (!parsed) {
-    const stderrLine = stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
     return {
       exitCode,
       signal: null,
       timedOut: false,
-      errorMessage: exitCode === 0
-        ? "Failed to parse Claude JSON output"
-        : stderrLine
-          ? `Claude exited with code ${exitCode ?? -1}: ${stderrLine}`
-          : `Claude exited with code ${exitCode ?? -1}`,
+      errorMessage: buildPartialRunError(exitCode, parsedStream.model, stdout),
       resultJson: { stdout },
     };
   }
