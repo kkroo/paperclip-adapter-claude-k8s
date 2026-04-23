@@ -5,12 +5,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/farhoodliquor/paperclip-adapter-claude-k8s"
+    "url": "https://github.com/farhoodlabs/paperclip-adapter-claude-k8s"
   },
   "bugs": {
-    "url": "https://github.com/farhoodliquor/paperclip-adapter-claude-k8s/issues"
+    "url": "https://github.com/farhoodlabs/paperclip-adapter-claude-k8s/issues"
   },
-  "homepage": "https://github.com/farhoodliquor/paperclip-adapter-claude-k8s#readme",
+  "homepage": "https://github.com/farhoodlabs/paperclip-adapter-claude-k8s#readme",
   "type": "module",
   "paperclip": {
     "adapterUiParser": "1.0.0"
