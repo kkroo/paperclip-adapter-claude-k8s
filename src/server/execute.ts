@@ -20,6 +20,11 @@ const MAX_LOG_RECONNECT_ATTEMPTS = 50;
 // Covers the cleanup path (delete job, parse stdout) so a slow K8s API call
 // doesn't trip the 5-minute reaper staleness window.
 const POST_TERMINAL_KEEPALIVE_MS = 90_000;
+// Upper bound on how long streamPodLogsOnce will wait after stopSignal fires
+// before force-returning, even if logApi.log has not yet resolved.  Defensive
+// against the K8s client library not propagating writable.destroy() into an
+// abort of the underlying HTTP request.
+const LOG_STREAM_BAIL_TIMEOUT_MS = 3_000;
 
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
@@ -272,25 +277,44 @@ async function streamPodLogsOnce(
   // in-flight follow stream.  Without this, logApi.log can hang indefinitely
   // when the pod terminates without closing the HTTP connection cleanly.
   let stopPoller: ReturnType<typeof setInterval> | null = null;
+  let bailTimer: ReturnType<typeof setTimeout> | null = null;
+  let bailResolve: (() => void) | null = null;
+  // Bail promise resolves LOG_STREAM_BAIL_TIMEOUT_MS after stopSignal fires,
+  // even if logApi.log has not resolved by then.  This is a safety net for the
+  // case where writable.destroy() fails to propagate to an abort of the HTTP
+  // request (e.g. the K8s client is awaiting a response that never comes).
+  const bailPromise = new Promise<void>((resolve) => {
+    bailResolve = resolve;
+  });
   if (stopSignal) {
     stopPoller = setInterval(() => {
-      if (stopSignal.stopped && !writable.destroyed) {
-        writable.destroy();
+      if (stopSignal.stopped) {
+        if (!writable.destroyed) writable.destroy();
+        if (!bailTimer && bailResolve) {
+          bailTimer = setTimeout(bailResolve, LOG_STREAM_BAIL_TIMEOUT_MS);
+        }
       }
     }, 200);
   }
 
-  try {
-    await logApi.log(namespace, podName, "claude", writable, {
-      follow: true,
-      pretty: false,
-      ...(sinceSeconds ? { sinceSeconds } : {}),
-    });
-  } catch {
+  const logPromise = logApi.log(namespace, podName, "claude", writable, {
+    follow: true,
+    pretty: false,
+    ...(sinceSeconds ? { sinceSeconds } : {}),
+  }).catch(() => {
     // follow may fail if the container already exited, the API connection
     // dropped, or we aborted via writable.destroy() — not fatal.
+  });
+
+  try {
+    if (stopSignal) {
+      await Promise.race([logPromise, bailPromise]);
+    } else {
+      await logPromise;
+    }
   } finally {
     if (stopPoller) clearInterval(stopPoller);
+    if (bailTimer) clearTimeout(bailTimer);
   }
 
   return chunks.join("");
