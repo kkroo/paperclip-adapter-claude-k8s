@@ -569,38 +569,72 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") === runId,
       );
 
-      // Pick the most recent reattachable orphan — same task + session, not
-      // terminal.  Only one target is chosen; any other orphans get cleaned up.
-      if (reattachOrphanedJobs && orphaned.length > 0) {
-        const candidates = orphaned
-          .filter((j) => classifyOrphan(j, { taskId: currentTaskLabel, sessionId: currentSessionLabel }) === "reattach")
-          .sort((a, b) => {
-            const at = new Date(a.metadata?.creationTimestamp ?? 0).getTime();
-            const bt = new Date(b.metadata?.creationTimestamp ?? 0).getTime();
-            return bt - at;
-          });
-        const chosen = candidates[0];
-        const chosenName = chosen?.metadata?.name;
-        if (chosen && chosenName) {
-          reattachTarget = {
-            jobName: chosenName,
-            namespace: chosen.metadata?.namespace ?? guardNamespace,
-            priorRunId: chosen.metadata?.labels?.["paperclip.io/run-id"] ?? "",
-            image: chosen.spec?.template?.spec?.containers?.[0]?.image ?? "unknown",
+      if (orphaned.length > 0) {
+        if (!reattachOrphanedJobs) {
+          // When reattach is disabled, block on any non-terminal orphan.
+          const names = orphaned.map((j) => j.metadata?.name).join(", ");
+          await onLog("stderr", `[paperclip] Concurrent run blocked: orphaned Job(s) running and reattach disabled: ${names}\n`);
+          return {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Concurrent run blocked: orphaned Job(s) still running for this agent (reattach disabled)`,
+            errorCode: "k8s_concurrent_run_blocked",
           };
         }
-      }
 
-      const toDelete = orphaned.filter(
-        (j) => !reattachTarget || j.metadata?.name !== reattachTarget.jobName,
-      );
-      if (toDelete.length > 0) {
-        const orphanNames = toDelete.map((j) => j.metadata?.name).join(", ");
-        await onLog("stdout", `[paperclip] Cleaning up ${toDelete.length} orphaned K8s Job(s) from previous run(s): ${orphanNames}\n`);
-        for (const j of toDelete) {
-          const name = j.metadata?.name;
-          if (name) {
-            await cleanupJob(guardNamespace, name, onLog, kubeconfigPath);
+        // Apply the decision matrix to each orphan, newest-first.  The first
+        // reattachable orphan becomes the target; any block classification
+        // stops the new run immediately.  Orphans are never deleted here —
+        // terminal ones are cleaned up by TTL; live mismatches should not be
+        // killed because they may still be doing real work.
+        const sortedOrphans = [...orphaned].sort((a, b) => {
+          const at = new Date(a.metadata?.creationTimestamp ?? 0).getTime();
+          const bt = new Date(b.metadata?.creationTimestamp ?? 0).getTime();
+          return bt - at;
+        });
+        for (const orphan of sortedOrphans) {
+          const classification = classifyOrphan(orphan, {
+            taskId: currentTaskLabel,
+            sessionId: currentSessionLabel,
+          });
+          const orphanName = orphan.metadata?.name ?? "unknown";
+          if (classification === "reattach") {
+            if (!reattachTarget) {
+              reattachTarget = {
+                jobName: orphanName,
+                namespace: orphan.metadata?.namespace ?? guardNamespace,
+                priorRunId: orphan.metadata?.labels?.["paperclip.io/run-id"] ?? "",
+                image: orphan.spec?.template?.spec?.containers?.[0]?.image ?? "unknown",
+              };
+            }
+          } else if (classification === "block_task_unknown") {
+            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} has missing task label — cannot safely reattach\n`);
+            return {
+              exitCode: null,
+              signal: null,
+              timedOut: false,
+              errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} has unknown task context`,
+              errorCode: "k8s_orphan_task_unknown",
+            };
+          } else if (classification === "block_task_mismatch") {
+            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} belongs to a different task\n`);
+            return {
+              exitCode: null,
+              signal: null,
+              timedOut: false,
+              errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} is running a different task`,
+              errorCode: "k8s_concurrent_run_blocked",
+            };
+          } else if (classification === "block_session_mismatch") {
+            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} has a different session\n`);
+            return {
+              exitCode: null,
+              signal: null,
+              timedOut: false,
+              errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} has a mismatched session`,
+              errorCode: "k8s_orphan_session_mismatch",
+            };
           }
         }
       }

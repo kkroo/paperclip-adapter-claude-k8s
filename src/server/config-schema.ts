@@ -93,7 +93,7 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "toggle",
       key: "reattachOrphanedJobs",
       label: "Reattach to Orphaned Jobs",
-      hint: "If a prior K8s Job for the same agent/task/session is still running (e.g. Paperclip restarted mid-run), attach to it and stream its output instead of deleting it and starting a new pod. Default: on.",
+      hint: "If a prior K8s Job for the same agent/task/session is still running (e.g. Paperclip restarted mid-run), attach to it and stream its output instead of blocking the new run. When false, any non-terminal orphan blocks the new run. Default: on.",
       default: true,
     },
     // Resource Limits
