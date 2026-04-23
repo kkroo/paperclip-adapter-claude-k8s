@@ -203,7 +203,9 @@ export interface JobBuildResult {
 }
 
 function sanitizeForK8sName(value: string, maxLen = 16): string {
-  return value.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, maxLen);
+  // Trim trailing hyphens after slicing so names don't end with `-` when
+  // truncation lands on a hyphen boundary (finding #16, FAR-15).
+  return value.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, maxLen).replace(/-+$/, "");
 }
 
 /**

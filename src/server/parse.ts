@@ -9,9 +9,12 @@ export function parseClaudeStreamJson(stdout: string) {
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
-  // Belt-and-braces dedup: track seen text blocks to filter duplicates
-  // caused by log stream reconnects replaying overlapping windows.
-  const seenTexts = new Set<string>();
+  // Belt-and-braces dedup: key by (message.id, textIndex) so a session that
+  // legitimately emits the same text twice in different turns isn't collapsed
+  // (finding #11, FAR-15).  The log-dedup filter handles reconnect overlaps
+  // at the line level; this guard only needs to protect against the same
+  // message block being parsed twice.
+  const seenBlocks = new Set<string>();
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -29,14 +32,20 @@ export function parseClaudeStreamJson(stdout: string) {
     if (type === "assistant") {
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
       const message = parseObject(event.message);
+      const messageId = asString(message.id, "");
       const content = Array.isArray(message.content) ? message.content : [];
-      for (const entry of content) {
+      for (let i = 0; i < content.length; i++) {
+        const entry = content[i];
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
         const block = entry as Record<string, unknown>;
         if (asString(block.type, "") === "text") {
           const text = asString(block.text, "");
-          if (text && !seenTexts.has(text)) {
-            seenTexts.add(text);
+          if (!text) continue;
+          // Prefer (messageId, index) when the message has an id; fall back
+          // to text content when it doesn't (legacy/partial events).
+          const key = messageId ? `${messageId}:${i}` : `text:${text}`;
+          if (!seenBlocks.has(key)) {
+            seenBlocks.add(key);
             assistantTexts.push(text);
           }
         }
