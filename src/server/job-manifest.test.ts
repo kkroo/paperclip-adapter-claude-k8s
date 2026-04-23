@@ -517,11 +517,64 @@ describe("buildJobManifest", () => {
       expect(claudeArgs).toContain("--dangerously-skip-permissions");
     });
 
-    it("adds --append-system-prompt-file when instructionsFilePath set", () => {
+    it("adds --append-system-prompt-file (config fallback) when instructionsFilePath set and no session", () => {
       ctx.config = { instructionsFilePath: "/paperclip/instructions.md" };
       const { claudeArgs } = buildJobManifest({ ctx, selfPod });
       expect(claudeArgs).toContain("--append-system-prompt-file");
       expect(claudeArgs).toContain("/paperclip/instructions.md");
+    });
+
+    it("omits --append-system-prompt-file on session resume (avoids token waste)", () => {
+      ctx.config = { instructionsFilePath: "/paperclip/instructions.md" };
+      ctx.runtime.sessionId = "sess_existing";
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).not.toContain("--append-system-prompt-file");
+    });
+
+    it("adds --add-dir when promptBundle is provided", () => {
+      const promptBundle = {
+        bundleKey: "abc123",
+        rootDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+        addDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+        instructionsFilePath: null,
+      };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod, promptBundle });
+      expect(claudeArgs).toContain("--add-dir");
+      expect(claudeArgs).toContain(promptBundle.addDir);
+    });
+
+    it("uses bundle instructionsFilePath for --append-system-prompt-file when promptBundle provided", () => {
+      const promptBundle = {
+        bundleKey: "abc123",
+        rootDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+        addDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+        instructionsFilePath: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123/agent-instructions.md",
+      };
+      ctx.config = { instructionsFilePath: "/raw/path/AGENTS.md" };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod, promptBundle });
+      expect(claudeArgs).toContain("--append-system-prompt-file");
+      const idx = claudeArgs.indexOf("--append-system-prompt-file");
+      expect(claudeArgs[idx + 1]).toBe(promptBundle.instructionsFilePath);
+      expect(claudeArgs).not.toContain("/raw/path/AGENTS.md");
+    });
+
+    it("omits --append-system-prompt-file from bundle on session resume", () => {
+      const promptBundle = {
+        bundleKey: "abc123",
+        rootDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+        addDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+        instructionsFilePath: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123/agent-instructions.md",
+      };
+      ctx.runtime.sessionId = "sess_existing";
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod, promptBundle });
+      expect(claudeArgs).not.toContain("--append-system-prompt-file");
+      // --add-dir must still be present even on resume
+      expect(claudeArgs).toContain("--add-dir");
+    });
+
+    it("omits --add-dir when no promptBundle", () => {
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).not.toContain("--add-dir");
     });
 
     it("appends extraArgs when configured", () => {

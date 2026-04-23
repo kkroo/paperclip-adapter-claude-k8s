@@ -10,6 +10,7 @@ import {
   renderTemplate,
 } from "@paperclipai/adapter-utils/server-utils";
 import { createHash } from "node:crypto";
+import type { ClaudePromptBundle } from "./prompt-cache.js";
 
 /**
  * Build the shell command prefix that installs a native Node.js PostToolUse
@@ -175,6 +176,8 @@ function parseKeyValueConfig(raw: unknown): Record<string, string> {
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
+  /** Prepared prompt bundle (skills + instructions). When provided, --add-dir and --append-system-prompt-file use bundle paths. */
+  promptBundle?: ClaudePromptBundle | null;
 }
 
 /** When the prompt exceeds the env-var size limit, the manifest uses a
@@ -327,7 +330,7 @@ function buildEnvVars(
 }
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
-  const { ctx, selfPod } = input;
+  const { ctx, selfPod, promptBundle } = input;
   const { runId, agent, runtime, config: rawConfig, context } = ctx;
   const config = parseObject(rawConfig);
 
@@ -403,14 +406,22 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   };
 
   // Build Claude CLI args
-  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  // Prefer the bundle's materialized instructions file over the raw config path.
+  // Never inject --append-system-prompt-file on session resumes — the instructions
+  // are already in the session cache and re-injecting wastes tokens.
+  const rawInstructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const effectiveInstructionsFilePath =
+    promptBundle?.instructionsFilePath ?? (rawInstructionsFilePath || null);
   const claudeArgs = ["--print", "-", "--output-format", "stream-json", "--verbose"];
   if (runtimeSessionId) claudeArgs.push("--resume", runtimeSessionId);
   if (dangerouslySkipPermissions) claudeArgs.push("--dangerously-skip-permissions");
   if (model) claudeArgs.push("--model", model);
   if (effort) claudeArgs.push("--effort", effort);
   if (maxTurns > 0) claudeArgs.push("--max-turns", String(maxTurns));
-  if (instructionsFilePath) claudeArgs.push("--append-system-prompt-file", instructionsFilePath);
+  if (effectiveInstructionsFilePath && !runtimeSessionId) {
+    claudeArgs.push("--append-system-prompt-file", effectiveInstructionsFilePath);
+  }
+  if (promptBundle) claudeArgs.push("--add-dir", promptBundle.addDir);
   if (extraArgs.length > 0) claudeArgs.push(...extraArgs);
 
   // Build env vars

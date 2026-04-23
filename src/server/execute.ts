@@ -1,5 +1,15 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import { asString, asNumber, asBoolean, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import {
+  asString,
+  asNumber,
+  asBoolean,
+  parseObject,
+  readPaperclipRuntimeSkillEntries,
+  resolvePaperclipDesiredSkillNames,
+} from "@paperclipai/adapter-utils/server-utils";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
@@ -619,6 +629,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let namespace: string;
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
 
+  // Prepare the prompt bundle (skills + instructions) on the server filesystem.
+  // The K8s Job pod mounts the same PVC at /paperclip, so bundle paths written
+  // here are accessible inside the pod at the identical absolute path.
+  const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
+  const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
+  const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
+  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+  let instructionsContents: string | null = null;
+  if (instructionsFilePath) {
+    try {
+      const raw = await fs.readFile(instructionsFilePath, "utf-8");
+      const pathDirective =
+        `\nThe above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `Resolve any relative file references from ${instructionsFileDir}. ` +
+        `This base directory is authoritative for sibling instruction files such as ` +
+        `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`;
+      instructionsContents = raw + pathDirective;
+    } catch (err) {
+      await onLog(
+        "stderr",
+        `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+  const promptBundle = await prepareClaudePromptBundle({
+    companyId: ctx.agent.companyId,
+    skills: desiredSkills,
+    instructionsContents,
+    onLog,
+  });
+
   if (reattachTarget) {
     jobName = reattachTarget.jobName;
     namespace = reattachTarget.namespace;
@@ -646,7 +688,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await onLog("stdout", `[paperclip] Reattaching to in-flight K8s Job ${jobName} in namespace ${namespace} (prior run ${reattachTarget.priorRunId || "unknown"})\n`);
   } else {
     // Build Job manifest
-    const built = buildJobManifest({ ctx, selfPod });
+    const built = buildJobManifest({ ctx, selfPod, promptBundle });
     const job = built.job;
     jobName = built.jobName;
     namespace = built.namespace;

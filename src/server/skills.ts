@@ -33,7 +33,7 @@ async function buildK8sSkillSnapshot(
     sourcePath: entry.source,
     targetPath: null,
     detail: desiredSet.has(entry.key)
-      ? "Injected via prompt bundle into ephemeral K8s Job pods."
+      ? "Materialized into the PVC-backed Claude prompt bundle before each K8s Job run."
       : null,
     required: Boolean(entry.required),
     requiredReason: entry.requiredReason ?? null,
