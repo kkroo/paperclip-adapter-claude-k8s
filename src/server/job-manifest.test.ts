@@ -166,6 +166,41 @@ describe("buildJobManifest", () => {
       expect(job.metadata?.labels?.["paperclip.io/task-id"]).toBeUndefined();
       expect(job.metadata?.labels?.["paperclip.io/session-id"]).toBeUndefined();
     });
+
+    it("drops user label with paperclip.io/ prefix", () => {
+      ctx.config = { labels: { "paperclip.io/run-id": "hijacked" } };
+      const { job, skippedLabels } = buildJobManifest({ ctx, selfPod });
+      expect(job.metadata?.labels?.["paperclip.io/run-id"]).not.toBe("hijacked");
+      expect(skippedLabels).toContain("paperclip.io/run-id");
+    });
+
+    it("drops user label with app.kubernetes.io/ prefix", () => {
+      ctx.config = { labels: { "app.kubernetes.io/managed-by": "attacker" } };
+      const { job, skippedLabels } = buildJobManifest({ ctx, selfPod });
+      expect(job.metadata?.labels?.["app.kubernetes.io/managed-by"]).toBe("paperclip");
+      expect(skippedLabels).toContain("app.kubernetes.io/managed-by");
+    });
+
+    it("passes through user label without reserved prefix", () => {
+      ctx.config = { labels: { "custom.io/team": "platform" } };
+      const { job, skippedLabels } = buildJobManifest({ ctx, selfPod });
+      expect(job.metadata?.labels?.["custom.io/team"]).toBe("platform");
+      expect(skippedLabels).not.toContain("custom.io/team");
+    });
+
+    it("populates skippedLabels with all dropped keys", () => {
+      ctx.config = {
+        labels: {
+          "paperclip.io/agent-id": "x",
+          "app.kubernetes.io/component": "y",
+          "safe": "z",
+        },
+      };
+      const { skippedLabels } = buildJobManifest({ ctx, selfPod });
+      expect(skippedLabels).toHaveLength(2);
+      expect(skippedLabels).toContain("paperclip.io/agent-id");
+      expect(skippedLabels).toContain("app.kubernetes.io/component");
+    });
   });
 
   describe("annotations", () => {

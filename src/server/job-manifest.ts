@@ -200,6 +200,8 @@ export interface JobBuildResult {
   /** Non-null when the prompt is too large for an env var and must be
    *  staged as a K8s Secret before creating the Job. */
   promptSecret: PromptSecret | null;
+  /** User-supplied extra labels that were dropped because they used a reserved prefix. */
+  skippedLabels: string[];
 }
 
 function sanitizeForK8sName(value: string, maxLen = 16): string {
@@ -460,8 +462,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (taskLabel) labels["paperclip.io/task-id"] = taskLabel;
   const sessionLabel = runtimeSessionId ? sanitizeLabelValue(runtimeSessionId) : null;
   if (sessionLabel) labels["paperclip.io/session-id"] = sessionLabel;
+  const skippedLabels: string[] = [];
   for (const [key, value] of Object.entries(extraLabels)) {
-    labels[key] = value;
+    if (key.startsWith("paperclip.io/") || key.startsWith("app.kubernetes.io/")) {
+      skippedLabels.push(key);
+    } else {
+      labels[key] = value;
+    }
   }
 
   // Volumes
@@ -628,5 +635,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, skippedLabels };
 }

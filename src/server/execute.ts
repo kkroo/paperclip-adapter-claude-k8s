@@ -700,6 +700,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const claudeArgs = built.claudeArgs;
     const promptMetrics = built.promptMetrics;
     promptSecret = built.promptSecret;
+    if (built.skippedLabels.length > 0) {
+      await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
+    }
 
     // Report invocation metadata
     if (onMeta) {
