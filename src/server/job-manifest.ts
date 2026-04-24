@@ -444,15 +444,22 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  // Labels
+  // Labels — system identifiers must pass RFC 1123 label value format.
+  const sanitizedAgentId = sanitizeLabelValue(agent.id);
+  const sanitizedRunId = sanitizeLabelValue(runId);
+  const sanitizedCompanyId = sanitizeLabelValue(agent.companyId);
+  const skippedLabels: string[] = [];
+  if (!sanitizedRunId) skippedLabels.push("paperclip.io/run-id");
+  if (!sanitizedCompanyId) skippedLabels.push("paperclip.io/company-id");
   const labels: Record<string, string> = {
     "app.kubernetes.io/managed-by": "paperclip",
     "app.kubernetes.io/component": "agent-job",
-    "paperclip.io/agent-id": agent.id,
-    "paperclip.io/run-id": runId,
-    "paperclip.io/company-id": agent.companyId,
+    // sanitizedAgentId null-check is enforced in execute.ts before Job creation
+    "paperclip.io/agent-id": sanitizedAgentId ?? agent.id,
     "paperclip.io/adapter-type": "claude_k8s",
   };
+  if (sanitizedRunId) labels["paperclip.io/run-id"] = sanitizedRunId;
+  if (sanitizedCompanyId) labels["paperclip.io/company-id"] = sanitizedCompanyId;
   // Reattach-target labels: let a future execute() identify this Job as the
   // continuation of the same logical unit of work (same task + same resume
   // session) so it can attach to the running pod across a Paperclip restart
@@ -462,7 +469,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (taskLabel) labels["paperclip.io/task-id"] = taskLabel;
   const sessionLabel = runtimeSessionId ? sanitizeLabelValue(runtimeSessionId) : null;
   if (sessionLabel) labels["paperclip.io/session-id"] = sessionLabel;
-  const skippedLabels: string[] = [];
   for (const [key, value] of Object.entries(extraLabels)) {
     if (key.startsWith("paperclip.io/") || key.startsWith("app.kubernetes.io/")) {
       skippedLabels.push(key);

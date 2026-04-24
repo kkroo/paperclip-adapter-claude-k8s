@@ -541,6 +541,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // the current runId.  When reattachOrphanedJobs is enabled and the orphan matches
   // the current agent+task+session, we attach to it instead of deleting it (FAR-124).
   const agentId = ctx.agent.id;
+  const sanitizedAgentId = sanitizeLabelValue(agentId);
+  if (!sanitizedAgentId) {
+    await onLog("stderr", `[paperclip] Cannot create K8s Job: agent.id "${agentId}" produces no valid RFC 1123 label characters\n`);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: `Agent ID "${agentId}" cannot be sanitized to a valid Kubernetes label`,
+      errorCode: "k8s_agent_id_invalid",
+    };
+  }
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
   const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, true);
@@ -554,7 +565,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const batchApi = getBatchApi(kubeconfigPath);
     const existing = await batchApi.listNamespacedJob({
       namespace: guardNamespace,
-      labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=claude_k8s`,
+      labelSelector: `paperclip.io/agent-id=${sanitizedAgentId},paperclip.io/adapter-type=claude_k8s`,
     });
     const running = existing.items.filter(
       (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),

@@ -203,6 +203,40 @@ describe("buildJobManifest", () => {
     });
   });
 
+  describe("system label sanitization (N4)", () => {
+    it("sanitizes agent.id with @ to a valid RFC 1123 label", () => {
+      ctx.agent.id = "user@example.com";
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const label = job.metadata?.labels?.["paperclip.io/agent-id"];
+      expect(label).toMatch(/^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/);
+      expect(label).not.toContain("@");
+    });
+
+    it("sanitizes agent.id with spaces to a valid RFC 1123 label", () => {
+      ctx.agent.id = "my agent id";
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const label = job.metadata?.labels?.["paperclip.io/agent-id"];
+      expect(label).toMatch(/^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/);
+    });
+
+    it("omits paperclip.io/run-id when sanitized value is null (all-invalid runId)", () => {
+      // inject an all-special-chars runId via context override — buildJobManifest
+      // uses ctx.runId directly
+      const badCtx = makeCtx({ runId: "@@@" });
+      const { job, skippedLabels } = buildJobManifest({ ctx: badCtx, selfPod });
+      expect(job.metadata?.labels?.["paperclip.io/run-id"]).toBeUndefined();
+      expect(skippedLabels).toContain("paperclip.io/run-id");
+    });
+
+    it("selector matches sanitized agent-id label", () => {
+      ctx.agent.id = "Agent@Test";
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const agentLabel = job.metadata?.labels?.["paperclip.io/agent-id"];
+      // the label should equal what sanitizeLabelValue produces
+      expect(agentLabel).toBe("AgentTest");
+    });
+  });
+
   describe("annotations", () => {
     it("includes adapter type and agent name annotations", () => {
       const { job } = buildJobManifest({ ctx, selfPod });

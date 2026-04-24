@@ -15,7 +15,7 @@ vi.mock("./k8s-client.js", () => ({
   resetCache: vi.fn(),
 }));
 
-const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce } = await import("./execute.js");
+const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce, execute } = await import("./execute.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -258,6 +258,25 @@ describe("describePodTerminatedError", () => {
     const msg = describePodTerminatedError("mypod", "Failed", cs);
     expect(msg).toContain("unknown");
     expect(msg).toContain("Error");
+  });
+});
+
+describe("execute: all-invalid agent.id (N4)", () => {
+  it("returns hard error without creating a Job when agent.id sanitizes to null", async () => {
+    const logs: string[] = [];
+    const result = await execute({
+      runId: "run-001",
+      agent: { id: "@@@", companyId: "co1", name: "Bad Agent", adapterType: "claude_k8s", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {},
+      context: {},
+      onLog: async (_stream, msg) => { logs.push(msg); },
+    });
+    expect(result.errorCode).toBe("k8s_agent_id_invalid");
+    expect(result.errorMessage).toContain("@@@");
+    // getSelfPodInfo must NOT have been called (early return before K8s calls)
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    expect(getSelfPodInfo).not.toHaveBeenCalled();
   });
 });
 
