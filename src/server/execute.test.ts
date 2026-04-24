@@ -18,6 +18,11 @@ const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
 const mockCorePatchSecret = vi.fn();
 const mockCoreDeleteSecret = vi.fn();
+// vi.hoisted ensures a single vi.fn() instance shared between the mock factory
+// (which runs at hoist time) and the test body (which calls mockResolvedValue).
+// A plain const would be re-assigned at its original position, leaving the
+// factory with a stale reference to a different vi.fn() instance.
+const mockReadSkillEntries = vi.hoisted(() => vi.fn());
 
 vi.mock("./k8s-client.js", () => ({
   getLogApi: () => ({ log: mockLogFn }),
@@ -45,6 +50,15 @@ vi.mock("./prompt-cache.js", () => ({
   prepareClaudePromptBundle: mockPrepareBundle,
 }));
 
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
+  // Enumerate all original exports so transitive deps (job-manifest.ts, parse.ts,
+  // prompt-cache.ts, etc.) keep working.  Only readPaperclipRuntimeSkillEntries
+  // is replaced so tests run without real fs.stat I/O under fake timers.
+  return Object.assign(Object.create(null), original, {
+    readPaperclipRuntimeSkillEntries: mockReadSkillEntries,
+  });
+});
 
 const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, streamPodLogsOnce, execute } = await import("./execute.js");
 
@@ -442,6 +456,7 @@ const CLAUDE_HAPPY_OUTPUT = [
 describe("execute: concurrency guard", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
   });
 
@@ -537,6 +552,7 @@ describe("execute: concurrency guard", () => {
 describe("execute: job creation", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
     mockBatchListJobs.mockResolvedValue({ items: [] }); // no concurrent jobs
     mockPrepareBundle.mockResolvedValue(makeBundle());
@@ -588,6 +604,7 @@ describe("execute: happy path", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.useFakeTimers();
+    mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
     mockBatchListJobs.mockResolvedValue({ items: [] });
     mockPrepareBundle.mockResolvedValue(makeBundle());
@@ -831,29 +848,20 @@ describe("execute: happy path", () => {
       makeCtx({ config: { timeoutSec: 4, graceSec: 0 } } as Partial<AdapterExecutionContext>),
     );
 
-    // Timer sequence (all times relative to when execute() registers fake timers,
-    // which is after readPaperclipRuntimeSkillEntries real I/O completes):
-    //   t+2000: waitForJobCompletion poll (non-terminal → sleep 2000ms more)
-    //   t+3000: streamPodLogs reconnect (attempt=1 → sleep 3000ms more)
-    //   t+4000: waitForJobCompletion deadline exceeded → timedOut=true → stopped=true
-    //   t+6000: streamPodLogs sleep ends → while(!stopped) → exits → allSettled resolves
-    //
-    // readPaperclipRuntimeSkillEntries does real fs.stat I/O under fake timers.
-    // Each advanceTimersByTimeAsync call gives one real event-loop turn for that
-    // I/O to complete. Multiple small advances ensure I/O drains before fake timers
-    // fire, and the total (~12200ms) covers the I/O delay plus the 6000ms sequence.
-    await vi.advanceTimersByTimeAsync(2_100);
-    await vi.advanceTimersByTimeAsync(1_100);
-    await vi.advanceTimersByTimeAsync(1_000);
+    // readPaperclipRuntimeSkillEntries is mocked (no real I/O).  Timer sequence:
+    //   t=2000: waitForJobCompletion poll 2 (non-terminal → sleep 2000ms)
+    //   t=3000: streamPodLogs reconnect sleep fires (attempt=1 → sleep 3000ms more)
+    //   t=4000: waitForJobCompletion deadline exceeded → timedOut=true → stopped=true
+    //   t=6000: reconnect sleep fires → while(!stopped) → exits → allSettled resolves
     await vi.advanceTimersByTimeAsync(2_000);
-    await vi.advanceTimersByTimeAsync(3_000);
-    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(2_000);
 
     const result = await executePromise;
 
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("timeout");
-  }, 15_000);
+  });
 
   it("waitForJobCompletion respects deadline and returns timedOut via poll loop", async () => {
     // timeoutSec=1, graceSec=0 → completionTimeoutMs=1000ms. The poll delay (2s)
@@ -863,21 +871,16 @@ describe("execute: happy path", () => {
     const executePromise = execute(
       makeCtx({ config: { timeoutSec: 1, graceSec: 0 } } as Partial<AdapterExecutionContext>),
     );
-    // Multiple advances provide event-loop turns for readPaperclipRuntimeSkillEntries
-    // I/O to drain before fake timers fire. Total ~8400ms covers the I/O delay
-    // (~4200ms observed in isolation) plus the 3000ms timer sequence needed:
-    //   t+2000: poll 2 fires, while(Date.now() < deadline) = false → timedOut=true → stopped=true
-    //   t+3000: reconnect sleep fires → while(!stopped) → exits → allSettled resolves
-    await vi.advanceTimersByTimeAsync(2_100);
-    await vi.advanceTimersByTimeAsync(1_100);
+    // readPaperclipRuntimeSkillEntries is mocked (no real I/O).  Timer sequence:
+    //   t=2000: poll sleep fires → Date.now()=2000 > deadline=1000 → timedOut=true → stopped=true
+    //   t=3000: reconnect sleep fires → while(!stopped) → exits → allSettled resolves
+    await vi.advanceTimersByTimeAsync(2_000);
     await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(2_100);
-    await vi.advanceTimersByTimeAsync(2_100);
     const result = await executePromise;
 
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("timeout");
-  }, 15_000);
+  });
 
   it("waits for pod creation (no-pod state) then succeeds when pod appears", async () => {
     // Override mockCoreListPods: first call returns empty (no pod yet),
@@ -902,19 +905,16 @@ describe("execute: happy path", () => {
 
     const executePromise = execute(makeCtx());
     // Multiple advances provide event-loop turns for readPaperclipRuntimeSkillEntries
-    // I/O to drain. Total ~9400ms covers I/O delay (~4200ms) plus the 5000ms
-    // sequence: waitForPod sleep (2000ms) → pod found → allSettled starts →
-    // waitForJobCompletion Complete (immediate, stopped=true) → streamPodLogs
-    // reconnect sleep (3000ms) → while(!stopped) → exits.
-    await vi.advanceTimersByTimeAsync(2_100);
-    await vi.advanceTimersByTimeAsync(1_100);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(2_100);
-    await vi.advanceTimersByTimeAsync(3_100);
+    // readPaperclipRuntimeSkillEntries is mocked (no real I/O).  Timer sequence:
+    //   t=2000: waitForPod sleep fires → Running pod found → streaming starts
+    //   waitForJobCompletion → Complete immediately → stopped=true (microtask)
+    //   t=5000: reconnect sleep fires → while(!stopped) → exits → allSettled resolves
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(3_000);
     const result = await executePromise;
 
     expect(result.exitCode).toBe(0);
-  }, 15_000);
+  });
 
   it("logs warning and continues when instructionsFilePath file does not exist", async () => {
     // The catch block in execute() logs a warning and proceeds with null instructions
@@ -967,16 +967,19 @@ describe("execute: happy path", () => {
       });
 
     const executePromise = execute(makeCtx());
-    // First poll: Pending → logs phase, schedules next poll at t=2000
-    // Second poll: Running → waitForPod returns, then log streaming begins
-    // Third advance: fires streamPodLogs 3s reconnect timer
-    await vi.advanceTimersByTimeAsync(2_100); // t=0→2100: first waitForPod poll (Pending)
-    await vi.advanceTimersByTimeAsync(2_100); // t=2100→4200: second waitForPod poll (Running)
-    await vi.advanceTimersByTimeAsync(3_100); // t=4200→7300: streamPodLogs reconnect
+    // Timer sequence:
+    //   t+2000: waitForPod poll 1 (Pending → logs phase)
+    //   t+4000: waitForPod poll 2 (Running → pod found, streaming starts)
+    //   t+7000: streamPodLogs 3s reconnect sleep fires → while(!stopped) → exits
+    // readPaperclipRuntimeSkillEntries is mocked (no real I/O), so fake timers
+    // apply from the moment execute() is called.
+    await vi.advanceTimersByTimeAsync(2_000); // t+2000: poll 1 fires
+    await vi.advanceTimersByTimeAsync(2_000); // t+4000: poll 2 fires → pod found
+    await vi.advanceTimersByTimeAsync(3_000); // t+7000: reconnect sleep fires → done
     const result = await executePromise;
 
     expect(result.exitCode).toBe(0);
-  }, 15_000);
+  });
 
   it("returns running pod via allInitsDone && mainRunning even when phase=Pending", async () => {
     // Phase stays Pending, but init containers are done and main is running.
@@ -1013,6 +1016,7 @@ describe("execute: happy path", () => {
 describe("execute: waitForPod edge cases", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
     mockBatchListJobs.mockResolvedValue({ items: [] });
     mockPrepareBundle.mockResolvedValue(makeBundle());
@@ -1111,6 +1115,7 @@ describe("execute: log-stream-exit grace period (FAR-23)", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.useFakeTimers();
+    mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
     mockBatchListJobs.mockResolvedValue({ items: [] });
     mockPrepareBundle.mockResolvedValue(makeBundle());
@@ -1148,17 +1153,14 @@ describe("execute: log-stream-exit grace period (FAR-23)", () => {
     // No timeoutSec → completionTimeoutMs=0 → polls indefinitely without grace.
     const executePromise = execute(makeCtx());
 
-    // Advance past:
-    //   ~4200ms of readPaperclipRuntimeSkillEntries real I/O (multiple small advances)
-    //   3100ms: streamPodLogs reconnect sleep (attempt=1, stopSignal still false at entry)
-    //   + 30100ms: grace period (LOG_EXIT_COMPLETION_GRACE_MS = 30s)
-    //   + 3100ms: streamPodLogs bail timer (stopSignal was set by grace → bail fires)
-    await vi.advanceTimersByTimeAsync(2_100);
-    await vi.advanceTimersByTimeAsync(1_100);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(3_100); // reconnect sleep
-    await vi.advanceTimersByTimeAsync(30_100); // grace fires
-    await vi.advanceTimersByTimeAsync(3_500); // bail timer + margin
+    // readPaperclipRuntimeSkillEntries is mocked (no real I/O).  waitForPod
+    // resolves immediately (Running pod on first poll).  Timer sequence:
+    //   t=3000: first reconnect sleep → loop continues (stopSignal still false)
+    //   t=30000: gracePoller fires → stopSignal.stopped = true
+    //   t≤33000: current sleep fires → while(!stopped) → exit → trackedLogStream resolves
+    await vi.advanceTimersByTimeAsync(3_100); // first reconnect sleep
+    await vi.advanceTimersByTimeAsync(30_100); // grace fires at t=30000
+    await vi.advanceTimersByTimeAsync(3_500); // remaining sleep + margin
     const result = await executePromise;
 
     // Grace fires → jobGone=true → execute proceeds with one-shot logs → success
