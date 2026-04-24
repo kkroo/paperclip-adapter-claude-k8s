@@ -796,6 +796,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
   const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
   const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
+  const skillSummary = desiredSkills.length > 0 ? desiredSkills.map((s) => s.runtimeName ?? s.key).join(", ") : "none";
+  await onLog("stdout", `[paperclip] Skills bundled (${desiredSkills.length}): ${skillSummary}\n`);
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsContents: string | null = null;
@@ -892,6 +894,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
           `Namespace: ${namespace}`,
           `Timeout: ${timeoutSec}s`,
+          `Skills (${desiredSkills.length}): ${skillSummary}`,
         ],
         prompt,
         ...(promptMetrics ? { promptMetrics } : {}),

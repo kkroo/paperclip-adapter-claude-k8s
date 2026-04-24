@@ -1167,6 +1167,62 @@ describe("execute: happy path", () => {
 
     expect(result.exitCode).toBe(0);
   });
+
+  it("logs bundled skill names and count (FAR-36 diagnostic)", async () => {
+    const skills = [
+      { key: "safety--abc123", runtimeName: "safety--abc123", desired: true, managed: true, required: true, state: "configured" as const },
+      { key: "sdlc--def456", runtimeName: "sdlc--def456", desired: true, managed: true, required: true, state: "configured" as const },
+    ];
+    mockReadSkillEntries.mockResolvedValue(skills);
+
+    const logs: Array<{ stream: string; msg: string }> = [];
+    const onLog = vi.fn().mockImplementation(async (stream: string, msg: string) => { logs.push({ stream, msg }); });
+
+    const executePromise = execute(makeCtx({ onLog } as Partial<AdapterExecutionContext>));
+    await vi.advanceTimersByTimeAsync(3_100);
+    await executePromise;
+
+    const skillLine = logs.find((l) => l.msg.includes("Skills bundled"));
+    expect(skillLine).toBeDefined();
+    expect(skillLine?.stream).toBe("stdout");
+    expect(skillLine?.msg).toContain("(2):");
+    expect(skillLine?.msg).toContain("safety--abc123");
+    expect(skillLine?.msg).toContain("sdlc--def456");
+  });
+
+  it("logs Skills bundled (0): none when no skills are configured (FAR-36 diagnostic)", async () => {
+    mockReadSkillEntries.mockResolvedValue([]);
+
+    const logs: Array<{ stream: string; msg: string }> = [];
+    const onLog = vi.fn().mockImplementation(async (stream: string, msg: string) => { logs.push({ stream, msg }); });
+
+    const executePromise = execute(makeCtx({ onLog } as Partial<AdapterExecutionContext>));
+    await vi.advanceTimersByTimeAsync(3_100);
+    await executePromise;
+
+    const skillLine = logs.find((l) => l.msg.includes("Skills bundled"));
+    expect(skillLine).toBeDefined();
+    expect(skillLine?.msg).toContain("(0): none");
+  });
+
+  it("includes skill count in onMeta commandNotes (FAR-36 diagnostic)", async () => {
+    const skills = [
+      { key: "safety--abc123", runtimeName: "safety--abc123", desired: true, managed: true, required: true, state: "configured" as const },
+    ];
+    mockReadSkillEntries.mockResolvedValue(skills);
+
+    const onMeta = vi.fn().mockResolvedValue(undefined);
+    const executePromise = execute(makeCtx({ onMeta } as Partial<AdapterExecutionContext>));
+    await vi.advanceTimersByTimeAsync(3_100);
+    await executePromise;
+
+    expect(onMeta).toHaveBeenCalled();
+    const notes: string[] = onMeta.mock.calls[0][0].commandNotes;
+    const skillsNote = notes.find((n: string) => n.startsWith("Skills"));
+    expect(skillsNote).toBeDefined();
+    expect(skillsNote).toContain("(1):");
+    expect(skillsNote).toContain("safety--abc123");
+  });
 });
 
 // ─── execute: waitForPod edge cases ──────────────────────────────────────────
