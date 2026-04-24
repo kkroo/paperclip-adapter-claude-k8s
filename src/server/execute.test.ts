@@ -1637,3 +1637,91 @@ describe("execute: SIGTERM handler best-effort cleanup", () => {
     // so we do not need to settle executePromise.
   });
 });
+
+// ─── execute: per-agent creation mutex (FAR-29 TOCTOU fix) ───────────────────
+//
+// Verifies that two concurrent execute() calls for the same agent cannot both
+// enter the listNamespacedJob → createNamespacedJob sequence simultaneously.
+// Without the per-agent mutex, both would pass the concurrency guard before
+// either job appears in the other's list query.
+
+describe("execute: per-agent creation mutex prevents TOCTOU race", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    // Make job creation fail so the guard+create phase exits quickly and
+    // releases the mutex without needing to mock the full streaming path.
+    mockBatchCreateJob.mockRejectedValue(new Error("mock: create not configured"));
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
+  });
+
+  it("serializes guard phases for the same agent: call-2 waits until call-1 exits guard+create", async () => {
+    const listCalls: string[] = [];
+    let resolveFirstList!: (v: { items: [] }) => void;
+
+    mockBatchListJobs
+      .mockImplementationOnce(() => {
+        listCalls.push("call-1");
+        return new Promise<{ items: [] }>((resolve) => { resolveFirstList = resolve; });
+      })
+      .mockImplementation(() => {
+        listCalls.push("call-2");
+        return Promise.resolve({ items: [] });
+      });
+
+    const p1 = execute(makeCtx({ runId: "run-1" }));
+    const p2 = execute(makeCtx({ runId: "run-2" }));
+
+    // Drain microtasks: call-1 should be suspended in listNamespacedJob while
+    // call-2 waits behind the per-agent mutex, not yet calling list.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(listCalls).toEqual(["call-1"]);
+
+    // Let call-1's guard resolve (no running jobs). It will proceed to job
+    // creation, fail (mock rejects), and release the mutex in finally.
+    resolveFirstList({ items: [] });
+    await Promise.allSettled([p1, p2]);
+
+    // call-2 must have listed, and only AFTER call-1's guard resolved.
+    // The exact order: call-1 listed → call-1 list resolved → call-2 listed.
+    expect(listCalls).toEqual(["call-1", "call-2"]);
+  });
+
+  it("does not serialize guard phases for different agents", async () => {
+    const listCalls: string[] = [];
+    let resolveAgentAList!: (v: { items: [] }) => void;
+
+    // Agent A's list is artificially slow. Agent B (different id) should
+    // proceed immediately without waiting — the mutex is keyed by agent id.
+    mockBatchListJobs
+      .mockImplementationOnce(() => {
+        listCalls.push("A");
+        return new Promise<{ items: [] }>((resolve) => { resolveAgentAList = resolve; });
+      })
+      .mockImplementation(() => {
+        listCalls.push("B");
+        return Promise.resolve({ items: [] });
+      });
+
+    const ctxA = makeCtx({ runId: "run-A" });
+    const ctxB = makeCtx({
+      runId: "run-B",
+      agent: { id: "agent-other", companyId: "co1", name: "Other Agent", adapterType: "claude_k8s", adapterConfig: {} },
+    } as Partial<AdapterExecutionContext>);
+
+    const pA = execute(ctxA);
+    const pB = execute(ctxB);
+
+    // Drain microtasks — B should have called list even though A is still
+    // suspended, because they use separate mutex slots.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(listCalls).toContain("B");
+
+    // Let A complete so the promises settle cleanly.
+    resolveAgentAList({ items: [] });
+    await Promise.allSettled([pA, pB]);
+  });
+});

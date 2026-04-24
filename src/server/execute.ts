@@ -48,6 +48,10 @@ interface ActiveJobRef {
   kubeconfigPath?: string;
 }
 const activeJobs = new Set<ActiveJobRef>();
+// Per-agent serialization lock: prevents the TOCTOU race (FAR-29) where two
+// concurrent execute() calls for the same agent both pass the list-then-create
+// guard and create K8s Jobs simultaneously on the shared PVC.
+const agentCreationMutex = new Map<string, Promise<void>>();
 let sigtermHandlerRegistered = false;
 
 function ensureSigtermHandler(): void {
@@ -633,17 +637,40 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: "k8s_agent_id_invalid",
     };
   }
+  // FAR-29: serialize guard+create per agent within this process to prevent the
+  // TOCTOU race where two concurrent execute() calls both pass the list-then-create
+  // guard and create K8s Jobs simultaneously on the shared PVC.
+  const _prevCreation = agentCreationMutex.get(agentId) ?? Promise.resolve();
+  let _releaseMutex: () => void = () => {};
+  const _mutexSlot = new Promise<void>((resolve) => { _releaseMutex = resolve; });
+  // Chain: next caller for this agent waits on _mutexSlot, which resolves in finally.
+  agentCreationMutex.set(agentId, _prevCreation.then(() => _mutexSlot, () => _mutexSlot));
+  // Wait for any prior execute() call to finish its guard+create phase.
+  await _prevCreation.catch(() => {});
+
+  // Hoist declarations used in both the guard+create phase and the log-streaming
+  // section so the mutex try/finally can be added without a large re-indent.
+  let reattachTarget: { jobName: string; namespace: string; priorRunId: string; image: string } | null = null;
+  // eslint-disable-next-line prefer-const
+  let jobName!: string;
+  // eslint-disable-next-line prefer-const
+  let namespace!: string;
+  let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
+  // runtimeSessionParams and currentSessionIdRaw are also used after the
+  // try block (in the result-parsing section) so hoist them here.
+  const runtimeSessionParams = parseObject(runtime.sessionParams);
+  const currentSessionIdRaw = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  const coreApi = getCoreApi(kubeconfigPath);
+  const batchApi = getBatchApi(kubeconfigPath);
+
+  try {
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
   const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, true);
-  const runtimeSessionParams = parseObject(runtime.sessionParams);
-  const currentSessionIdRaw = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
   const currentSessionLabel = currentSessionIdRaw ? sanitizeLabelValue(currentSessionIdRaw) : null;
   const currentTaskIdRaw = asString(ctx.context.taskId, "") || asString(ctx.context.issueId, "");
   const currentTaskLabel = currentTaskIdRaw ? sanitizeLabelValue(currentTaskIdRaw) : null;
-  let reattachTarget: { jobName: string; namespace: string; priorRunId: string; image: string } | null = null;
   try {
-    const batchApi = getBatchApi(kubeconfigPath);
     const existing = await batchApi.listNamespacedJob({
       namespace: guardNamespace,
       labelSelector: `paperclip.io/agent-id=${sanitizedAgentId},paperclip.io/adapter-type=claude_k8s`,
@@ -762,13 +789,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: "k8s_concurrency_guard_unreachable",
     };
   }
-
-  const coreApi = getCoreApi(kubeconfigPath);
-  const batchApi = getBatchApi(kubeconfigPath);
-
-  let jobName: string;
-  let namespace: string;
-  let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
 
   // Prepare the prompt bundle (skills + instructions) on the server filesystem.
   // The K8s Job pod mounts the same PVC at /paperclip, so bundle paths written
@@ -966,6 +986,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
+  }
+  } finally {
+    // Release the per-agent creation mutex so the next queued execute() call
+    // can proceed with its guard+create phase (FAR-29).
+    _releaseMutex();
   }
 
   let stdout = "";
