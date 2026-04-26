@@ -90,13 +90,23 @@ export function isK8s404(err: unknown): boolean {
 }
 
 /**
- * Returns true when the heartbeat-run status indicates the run is no longer
- * active and the K8s Job should be cancelled.
+ * Returns true when the heartbeat-run status indicates the run was explicitly
+ * cancelled and the K8s Job must be torn down.
+ *
+ * Only `cancelled` / `cancelling` qualify.  Treating any non-`running` status
+ * as cancellation (the previous behaviour) produced spurious
+ * k8s_job_deleted_externally errors for in-flight runs whenever the API
+ * briefly reported a transient or stale status — Nancy's runs at
+ * Privileged Escalation hit this without anyone actually cancelling them
+ * (FAR-107).  Other terminal statuses (`succeeded`/`failed`/`completed`)
+ * are unreachable in practice while the adapter is still executing
+ * (the adapter's own return is what flips them) and even if observed,
+ * they do not warrant our deleting a Job that may still be doing work.
  * Exported for unit tests.
  */
 export function shouldAbortForCancellation(runStatus: string | undefined): boolean {
   if (!runStatus) return false;
-  return runStatus !== "running";
+  return runStatus === "cancelled" || runStatus === "cancelling";
 }
 
 /**

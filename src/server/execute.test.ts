@@ -1561,16 +1561,24 @@ describe("shouldAbortForCancellation", () => {
     expect(shouldAbortForCancellation("cancelled")).toBe(true);
   });
 
-  it("returns true when status is 'failed'", () => {
-    expect(shouldAbortForCancellation("failed")).toBe(true);
+  it("returns true when status is 'cancelling'", () => {
+    expect(shouldAbortForCancellation("cancelling")).toBe(true);
   });
 
-  it("returns true when status is 'completed'", () => {
-    expect(shouldAbortForCancellation("completed")).toBe(true);
+  // FAR-107: terminal-but-not-cancelled statuses MUST NOT trigger Job deletion.
+  // The previous "anything but running" guard caused k8s_job_deleted_externally
+  // false positives for in-flight runs whenever the API briefly reported a
+  // transient/stale status.
+  it("returns false for non-cancellation terminal statuses (FAR-107)", () => {
+    expect(shouldAbortForCancellation("succeeded")).toBe(false);
+    expect(shouldAbortForCancellation("failed")).toBe(false);
+    expect(shouldAbortForCancellation("completed")).toBe(false);
   });
 
-  it("returns true for any non-running non-empty string", () => {
-    expect(shouldAbortForCancellation("unknown")).toBe(true);
+  it("returns false for unknown statuses (FAR-107)", () => {
+    expect(shouldAbortForCancellation("unknown")).toBe(false);
+    expect(shouldAbortForCancellation("queued")).toBe(false);
+    expect(shouldAbortForCancellation("pending")).toBe(false);
   });
 });
 
