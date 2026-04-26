@@ -1019,7 +1019,8 @@ describe("execute: happy path", () => {
     const result = await executePromise;
 
     expect(result.errorCode).toBe("k8s_job_deleted_externally");
-    expect(result.errorMessage).toBe("K8s Job was deleted externally before Claude could complete");
+    expect(result.errorMessage).toMatch(/^K8s Job was deleted externally before Claude could complete \[/);
+    expect(result.errorMessage).toContain("detected_via=");
     expect(result.exitCode).toBeNull();
   });
 

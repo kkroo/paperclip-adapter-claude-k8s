@@ -582,11 +582,14 @@ async function readPodLogs(
  * is treated as a soft terminal: succeeded=false, timedOut=false, jobGone=true.
  * The caller should log this and fall through to stdout parsing.
  */
+type JobConditionSnapshot = { type?: string; status?: string; reason?: string; message?: string };
+
 async function waitForJobCompletion(
   namespace: string,
   jobName: string,
   timeoutMs: number,
   kubeconfigPath?: string,
+  observer?: { lastConditions: JobConditionSnapshot[] | null; pollCount: number },
 ): Promise<{ succeeded: boolean; timedOut: boolean; jobGone?: boolean }> {
   const batchApi = getBatchApi(kubeconfigPath);
   const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
@@ -605,6 +608,12 @@ async function waitForJobCompletion(
       throw err;
     }
     const conditions = job.status?.conditions ?? [];
+    if (observer) {
+      observer.pollCount += 1;
+      observer.lastConditions = conditions.map((c) => ({
+        type: c.type, status: c.status, reason: c.reason, message: c.message,
+      }));
+    }
 
     const complete = conditions.find((c) => c.type === "Complete" && c.status === "True");
     if (complete) return { succeeded: true, timedOut: false };
@@ -1112,6 +1121,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Set when the job disappeared (404) or grace-timer fired before we saw a
   // terminal condition — used to emit a clearer error when stdout parsing fails.
   let jobDeletedExternally = false;
+  // Forensics for k8s_job_deleted_externally — captures which of the three
+  // detection paths observed the 404, the last successful Job-condition read
+  // before deletion, and timing.  Surfaced in the error message so the next
+  // occurrence is self-diagnosing instead of opaque (FAR-107).
+  let jobGoneDetectionPath: string | null = null;
+  let jobGoneAt: number | null = null;
+  const jobObserver: { lastConditions: JobConditionSnapshot[] | null; pollCount: number } = {
+    lastConditions: null,
+    pollCount: 0,
+  };
+  let podRunningAt: number | null = null;
 
   const activeJobRef: ActiveJobRef = {
     namespace,
@@ -1144,6 +1164,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
         await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
       }
+      podRunningAt = Date.now();
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1279,7 +1300,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // while streamPodLogs reconnects, holding execute() open for minutes.
     // logStopSignal.stopped is set on every settled path (fulfilled, rejected,
     // or grace) so streamPodLogs stops reconnecting promptly.
-    type CompletionResult = { succeeded: boolean; timedOut: boolean; jobGone?: boolean };
+    type CompletionResult = { succeeded: boolean; timedOut: boolean; jobGone?: boolean; gracePeriodFired?: boolean };
     let gracePoller: ReturnType<typeof setInterval> | null = null;
     const completionWithGrace = new Promise<CompletionResult>((resolve, reject) => {
       let settled = false;
@@ -1297,11 +1318,37 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         logStopSignal.stopped = true;
         reject(err);
       };
-      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then(settleOk).catch(settleErr);
+      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath, jobObserver).then(settleOk).catch(settleErr);
       gracePoller = setInterval(() => {
         if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
-          void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output (FAR-23)\n`).catch(() => {});
-          settleOk({ succeeded: false, timedOut: false, jobGone: true });
+          // Stop the grace poller immediately so we don't double-fire while the
+          // verification read below is in flight.
+          if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
+          // The log stream exiting only means the container stopped producing
+          // output — it does NOT prove the Job was deleted.  Verify Job
+          // presence with a one-shot read so we can distinguish:
+          //   (a) Job 404 → truly gone (TTL or external deletion)
+          //   (b) Job still present → K8s condition propagation lag (FAR-23)
+          // Without this check we mis-classify (b) as "deleted externally" and
+          // emit a false-positive k8s_job_deleted_externally error (FAR-107).
+          void (async () => {
+            try {
+              await getBatchApi(kubeconfigPath).readNamespacedJob({ name: jobName, namespace });
+              await onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update; Job ${jobName} still present — proceeding with captured output (FAR-23)\n`).catch(() => {});
+              settleOk({ succeeded: false, timedOut: false, gracePeriodFired: true });
+            } catch (err: unknown) {
+              if (isK8s404(err)) {
+                jobGoneDetectionPath = "grace-period-verify-404";
+                jobGoneAt = Date.now();
+                await onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago and Job ${jobName} is gone (TTL or external deletion) — proceeding with captured output (FAR-23)\n`).catch(() => {});
+                settleOk({ succeeded: false, timedOut: false, jobGone: true });
+              } else {
+                // K8s API hiccup — bail out without claiming external deletion.
+                await onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago; Job state unverifiable (${err instanceof Error ? err.message : String(err)}) — proceeding with captured output (FAR-23)\n`).catch(() => {});
+                settleOk({ succeeded: false, timedOut: false, gracePeriodFired: true });
+              }
+            }
+          })();
         }
       }, 1_000);
     });
@@ -1369,6 +1416,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // completion), so log streaming has captured the full output — continue
         // to stdout parsing rather than returning an error.
         jobDeletedExternally = true;
+        if (!jobGoneDetectionPath) {
+          jobGoneDetectionPath = "completion-poll-404";
+          jobGoneAt = Date.now();
+        }
         await onLog("stdout", `[paperclip] Job ${jobName} was deleted before terminal condition was observed (TTL or external deletion) — proceeding with captured output.\n`);
       }
     } else {
@@ -1377,7 +1428,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // (60s) so we don't hang the heartbeat indefinitely if the K8s API is degraded.
       jobTimedOut = false;
       const RECHECK_TIMEOUT_MS = 60_000;
-      const actualState = await waitForJobCompletion(namespace, jobName, RECHECK_TIMEOUT_MS, kubeconfigPath);
+      const actualState = await waitForJobCompletion(namespace, jobName, RECHECK_TIMEOUT_MS, kubeconfigPath, jobObserver);
       if (actualState.timedOut) {
         // Re-check itself timed out — the job may still be running.
         // Return an error so the UI knows the run is not done.
@@ -1386,6 +1437,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Job was deleted before we could confirm terminal state — same as the
         // fulfilled+jobGone case above: proceed with captured output.
         jobDeletedExternally = true;
+        if (!jobGoneDetectionPath) {
+          jobGoneDetectionPath = "recheck-poll-404";
+          jobGoneAt = Date.now();
+        }
         await onLog("stdout", `[paperclip] Job ${jobName} was deleted before terminal condition was observed (TTL or external deletion) — proceeding with captured output.\n`);
       } else if (!actualState.succeeded) {
         // Job still not terminal — the completion error was likely transient.
@@ -1455,11 +1510,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   if (!parsed) {
     if (jobDeletedExternally && exitCode === null) {
+      // Forensic context (FAR-107): users sometimes see this error when nothing
+      // actually deleted the Job manually.  Surface enough state in the message
+      // to distinguish self-delete (SIGTERM/cancel), TTL-after-completion, and
+      // genuine external deletion without needing cluster shell access.
+      const detailParts: string[] = [];
+      if (jobGoneDetectionPath) detailParts.push(`detected_via=${jobGoneDetectionPath}`);
+      detailParts.push(`job=${jobName}`);
+      detailParts.push(`ns=${namespace}`);
+      if (podRunningAt !== null && jobGoneAt !== null) {
+        detailParts.push(`elapsed_since_pod_running=${Math.round((jobGoneAt - podRunningAt) / 1000)}s`);
+      }
+      detailParts.push(`completion_polls=${jobObserver.pollCount}`);
+      const lastConds = jobObserver.lastConditions;
+      if (lastConds && lastConds.length > 0) {
+        const summary = lastConds
+          .map((c) => `${c.type}=${c.status}${c.reason ? `(${c.reason})` : ""}`)
+          .join(",");
+        detailParts.push(`last_job_conditions=[${summary}]`);
+      } else {
+        detailParts.push("last_job_conditions=none_observed");
+      }
+      detailParts.push(`stdout_bytes=${stdout.length}`);
+      const stdoutLines = stdout.split("\n").filter((l) => l.trim()).length;
+      detailParts.push(`stdout_nonempty_lines=${stdoutLines}`);
       return {
         exitCode,
         signal: null,
         timedOut: false,
-        errorMessage: "K8s Job was deleted externally before Claude could complete",
+        errorMessage: `K8s Job was deleted externally before Claude could complete [${detailParts.join(", ")}]`,
         errorCode: "k8s_job_deleted_externally",
         resultJson: { stdout },
       };
