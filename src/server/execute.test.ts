@@ -1512,6 +1512,54 @@ describe("execute: log-stream-exit grace period (FAR-23)", () => {
     // (grace did not fire, real completion arrived)
     expect(result.errorMessage).toBeNull();
   });
+
+  it("does NOT fire grace when stream drops mid-output and reconnects with more output (FAR-107)", async () => {
+    // Reproduces Nancy / Privileged Escalation symptom: the K8s log API drops
+    // the streaming connection mid-run; streamPodLogs reconnects and the
+    // container is still producing.  Before the fix, the grace timer was
+    // armed on first stream exit and fired 30s later regardless of whether
+    // output had resumed, surfacing claude_truncated even though the pod was
+    // still phase=Running.
+    let attemptIndex = 0;
+    mockLogFn.mockImplementation(
+      async (_ns: string, _pod: string, _ctr: string, writable: import("node:stream").Writable) => {
+        if (attemptIndex === 0) {
+          // Stream a partial init line then "drop" the connection without a
+          // result event — this is the transient API disconnect.
+          writable.write(JSON.stringify({ type: "system", subtype: "init", model: "claude-sonnet-4-6", session_id: "sess_test123" }) + "\n");
+          attemptIndex++;
+          return;
+        }
+        // Reconnect produces the rest of the stream including the result event.
+        writable.write(CLAUDE_HAPPY_OUTPUT);
+      },
+    );
+    // Job condition arrives only after the reconnect produces output, well
+    // beyond the 30s grace window; the old code would have grace-fired at
+    // ~30s and treated the run as truncated.
+    let readJobCalls = 0;
+    mockBatchReadJob.mockImplementation(async () => {
+      readJobCalls++;
+      // Stay non-terminal until the reconnect has had time to run and the
+      // grace window has fully elapsed since the FIRST disconnect.
+      if (readJobCalls < 25) return { status: { conditions: [] } };
+      return { status: { conditions: [{ type: "Complete", status: "True" }] } };
+    });
+
+    const executePromise = execute(makeCtx());
+    // t=3000: first reconnect sleep fires → second streamPodLogsOnce attempt
+    await vi.advanceTimersByTimeAsync(3_100);
+    // Drive past the old (buggy) 30s grace boundary without firing real completion
+    await vi.advanceTimersByTimeAsync(35_000);
+    // Then let the Job's Complete condition land
+    await vi.advanceTimersByTimeAsync(20_000);
+    const result = await executePromise;
+
+    // Run completed normally — grace must not have falsely truncated it.
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeUndefined();
+    expect(result.sessionId).toBe("sess_test123");
+  }, 80_000);
 });
 
 // ─── execute: concurrency guard — multiple orphan sorting ────────────────────

@@ -481,10 +481,18 @@ export async function streamPodLogsOnce(
  * Capped at MAX_LOG_RECONNECT_ATTEMPTS to prevent infinite reconnect
  * loops during sustained API partitions.
  *
- * onFirstStreamExit is called the first time streamPodLogsOnce returns
- * (container has exited or stream disconnected). Used by execute() to
- * start the LOG_EXIT_COMPLETION_GRACE_MS grace timer (FAR-23) without
- * waiting for all reconnects to exhaust.
+ * `activity` tracks stream liveness so execute()'s grace timer can
+ * distinguish a transient K8s log-API reconnect from a real container
+ * exit (FAR-107).  Two signals:
+ *  - `streamHasExited` becomes true on the first return from
+ *    streamPodLogsOnce.  Until then we are still in the warm-up window
+ *    and waitForJobCompletion is the authoritative signal — grace must
+ *    not fire.
+ *  - `lastActiveAt` advances every time a streamPodLogsOnce attempt
+ *    returns non-empty output (the container is still producing).
+ *    The grace timer fires only once GRACE_MS have passed since the
+ *    last chunk, so output that resumes after a transient drop keeps
+ *    the run alive.
  */
 async function streamPodLogs(
   namespace: string,
@@ -493,7 +501,7 @@ async function streamPodLogs(
   kubeconfigPath?: string,
   stopSignal?: { stopped: boolean },
   dedup?: LogLineDedupFilter,
-  onFirstStreamExit?: () => void,
+  activity?: { lastActiveAt: number; streamHasExited: boolean },
 ): Promise<string> {
   const allChunks: string[] = [];
   let attempt = 0;
@@ -524,14 +532,15 @@ async function streamPodLogs(
 
     const preStreamTs = Math.floor(Date.now() / 1000);
     const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds, dedup, stopSignal);
-    // Signal first stream exit immediately so the grace-period timer in
-    // execute() can start without waiting for all reconnects to complete.
-    if (attempt === 0) onFirstStreamExit?.();
+    if (activity) activity.streamHasExited = true;
     if (result) {
       allChunks.push(result);
       // Update last-received timestamp to now (the stream just ended,
       // so any log lines in `result` were received up to this moment).
       lastLogReceivedAt = Math.floor(Date.now() / 1000);
+      // Refresh stream liveness so the grace timer in execute() does not
+      // fire while output is still flowing through reconnects (FAR-107).
+      if (activity) activity.lastActiveAt = Date.now();
     } else if (attempt === 0) {
       // First attempt returned nothing — update timestamp so reconnect
       // window stays reasonable.
@@ -1340,17 +1349,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return onLog(stream, chunk);
     };
 
-    // Track when the log stream first exits so the grace-period can fire
-    // if the K8s Job condition lags behind container exit (FAR-23).
-    // Set via onFirstStreamExit callback (called after attempt=0 returns)
-    // rather than in .then() of streamPodLogs, which would create a
-    // deadlock: streamPodLogs only resolves after stopSignal is set, but
-    // stopSignal is set by the grace timer which needs logExitTime to be
-    // non-null.
-    let logExitTime: number | null = null;
+    // Track stream liveness so the grace timer below only fires when output
+    // has actually stopped — not on a transient K8s log-API reconnect that
+    // streamPodLogs heals on its own (FAR-107).
+    const streamActivity: { lastActiveAt: number; streamHasExited: boolean } = {
+      lastActiveAt: Date.now(),
+      streamHasExited: false,
+    };
     const trackedLogStream = streamPodLogs(
       namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal, logDedup,
-      () => { logExitTime = Date.now(); },
+      streamActivity,
     );
 
     // completionWithGrace races waitForJobCompletion against a grace timer
@@ -1380,7 +1388,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
       waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath, jobObserver).then(settleOk).catch(settleErr);
       gracePoller = setInterval(() => {
-        if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
+        // Only consider grace once the stream has exited at least once.
+        // Until then we are still in the warm-up window and
+        // waitForJobCompletion is the authoritative signal.  Once the
+        // stream has exited, fire only after GRACE_MS of inactivity
+        // measured against the last received chunk — output that resumes
+        // through a reconnect resets the clock so transient drops do not
+        // truncate live runs (FAR-107).
+        if (
+          streamActivity.streamHasExited &&
+          Date.now() - streamActivity.lastActiveAt >= LOG_EXIT_COMPLETION_GRACE_MS
+        ) {
           // Stop the grace poller immediately so we don't double-fire while the
           // verification read below is in flight.
           if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
