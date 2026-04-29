@@ -124,19 +124,44 @@ async function tailPodLogFile(
       if (!stopSignal.stopped) await new Promise((resolve) => setTimeout(resolve, pollInterval));
     }
 
-    // Final drain
-    if (offset < (await fs.stat(filePath)).size) {
-      const stat = await fs.stat(filePath);
-      const size = stat.size;
-      const buf = Buffer.alloc(size - offset);
-      const { bytesRead } = await handle.read(buf, 0, buf.length, offset);
-      const combined = pendingLine + buf.toString("utf-8", 0, bytesRead);
-      const lines = combined.split("\n");
-      pendingLine = lines.pop() ?? "";
-      for (const line of lines) {
-        accumulator.push(line);
-        await onLog("stdout", line + "\n");
+    // Final drain.  When the pod's `tee` flushes the trailing JSON result
+    // line moments before the Job is reported Complete, distributed
+    // filesystems (e.g. cephfs RWX where pod and reader run on different
+    // nodes) can lag on metadata propagation by a beat or two — a single
+    // size+read pass can miss those last lines and the parser then fails
+    // with "Failed to parse Claude JSON output" even though claude exited
+    // 0.  Poll size up to ~5 s until it goes stable for two consecutive
+    // checks before declaring drain complete.
+    const DRAIN_MAX_MS = 5_000;
+    const DRAIN_POLL_MS = 250;
+    const drainDeadline = Date.now() + DRAIN_MAX_MS;
+    let stableSize = -1;
+    while (true) {
+      const size = (await fs.stat(filePath)).size;
+      if (size > offset) {
+        const buf = Buffer.alloc(size - offset);
+        const { bytesRead } = await handle.read(buf, 0, buf.length, offset);
+        offset += bytesRead;
+        const combined = pendingLine + buf.toString("utf-8", 0, bytesRead);
+        const lines = combined.split("\n");
+        pendingLine = lines.pop() ?? "";
+        for (const line of lines) {
+          accumulator.push(line);
+          await onLog("stdout", line + "\n");
+        }
+        stableSize = -1; // reset stability counter — we just read more
+      } else if (size === stableSize) {
+        break; // size held steady across two polls — drain done
+      } else {
+        stableSize = size;
       }
+      if (Date.now() >= drainDeadline) break;
+      await new Promise((resolve) => setTimeout(resolve, DRAIN_POLL_MS));
+    }
+    if (pendingLine) {
+      accumulator.push(pendingLine);
+      await onLog("stdout", pendingLine + "\n");
+      pendingLine = "";
     }
   } finally {
     await handle.close();
@@ -1234,7 +1259,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath, jobObserver).then(r => { logStopSignal.stopped = true; return r; }),
     ]);
 
-    const stdout = tailResult.status === "fulfilled" ? tailResult.value : "";
+    let stdout = tailResult.status === "fulfilled" ? tailResult.value : "";
+
+    // Belt-and-braces: tailPodLogFile's drain can still miss the trailing
+    // `result` line on cephfs RWX when metadata propagation lags Job
+    // completion.  Read the full file from disk while it still exists —
+    // the cleanupJob path in `finally` will delete it before the parser
+    // runs further down.  Prefer the longer of (tail, file).
+    if (podLogPath) {
+      try {
+        const fsp = await import("node:fs/promises");
+        const onDisk = await fsp.readFile(podLogPath, "utf-8");
+        if (onDisk.length > stdout.length) {
+          await onLog("stderr", `[paperclip] tail accumulator (${stdout.length}b) < on-disk pod log (${onDisk.length}b); using on-disk for parse.\n`);
+          stdout = onDisk;
+        }
+      } catch {
+        // already cleaned up or unreadable — fall through with tail content
+      }
+    }
 
     if (completionResult.status === "fulfilled") {
       jobTimedOut = completionResult.value.timedOut;

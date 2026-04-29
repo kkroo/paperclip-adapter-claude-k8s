@@ -506,6 +506,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         imagePullPolicy: "IfNotPresent",
         command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${agent.companyId}/${agent.id} && cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt`],
         volumeMounts: [
+          { name: "data", mountPath: "/paperclip" },
           { name: "prompt", mountPath: "/tmp/prompt" },
           { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
         ],
@@ -521,7 +522,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         imagePullPolicy: "IfNotPresent",
         command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${agent.companyId}/${agent.id} && printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`],
         env: [{ name: "PROMPT_CONTENT", value: prompt }],
-        volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
+        volumeMounts: [
+          { name: "data", mountPath: "/paperclip" },
+          { name: "prompt", mountPath: "/tmp/prompt" },
+        ],
         securityContext,
         resources: {
           requests: { cpu: "10m", memory: "16Mi" },
