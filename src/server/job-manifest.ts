@@ -475,7 +475,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   assertSafePathComponent("agentId", logPathAgentId);
   assertSafePathComponent("runId", logPathRunId);
   const podLogPath = buildPodLogPath(logPathCompanyId, logPathAgentId, logPathRunId);
-  const claudeInvocation = `cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
+  // Refresh OAuth credentials via ccrotate before invoking claude. The shared
+  // /paperclip/.claude/.credentials.json on the RWX PVC may contain an expired
+  // access token (claude OAuth tokens last ~30-60 min and the paperclip pod
+  // doesn't refresh them automatically — that's ccrotate's job). Without this,
+  // claude in the Job pod fails with `401 Invalid authentication credentials`
+  // whenever the cached token is older than its expiresAt. Failure is
+  // non-fatal: if ccrotate isn't on PATH or no base-tier account is available,
+  // we still try claude with whatever credentials are on disk so the operator
+  // gets a meaningful 401-from-claude instead of an opaque init failure.
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --target claude >/dev/null 2>&1) || true`;
+  const claudeInvocation = `${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
   const mainCommand = claudeInvocation;
 
   // Decide prompt delivery strategy: env var (small) or Secret volume (large).
