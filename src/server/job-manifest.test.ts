@@ -311,6 +311,16 @@ describe("buildJobManifest", () => {
       expect(init?.volumeMounts).toContainEqual({ name: "prompt", mountPath: "/tmp/prompt" });
     });
 
+    it("write-prompt mounts the data PVC at /paperclip so mkdir of run-logs succeeds as runAsUser:1000", () => {
+      // Without this mount, the init container's `mkdir -p /paperclip/instances/...`
+      // fails with EACCES because uid 1000 cannot write to the container image's
+      // root filesystem. The data volume is the shared RWX PVC where run logs and
+      // session state live.
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.volumeMounts).toContainEqual({ name: "data", mountPath: "/paperclip" });
+    });
+
     it("prompt env var contains rendered prompt text", () => {
       const { job, prompt } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
