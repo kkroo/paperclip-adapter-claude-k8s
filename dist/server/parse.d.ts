@@ -6,6 +6,8 @@ export declare function parseClaudeStreamJson(stdout: string): {
     usage: UsageSummary | null;
     summary: string;
     resultJson: Record<string, unknown> | null;
+    llmApiEmptyResponse: boolean;
+    truncatedMidStream: boolean;
 };
 export declare function extractClaudeLoginUrl(text: string): string | null;
 export declare function detectClaudeLoginRequired(input: {

@@ -7,24 +7,48 @@ import type * as k8s from "@kubernetes/client-node";
  */
 export declare function isK8s404(err: unknown): boolean;
 /**
+ * Returns true when the heartbeat-run status indicates the run was explicitly
+ * cancelled and the K8s Job must be torn down.
+ *
+ * Only `cancelled` / `cancelling` qualify.  Treating any non-`running` status
+ * as cancellation (the previous behaviour) produced spurious
+ * k8s_job_deleted_externally errors for in-flight runs whenever the API
+ * briefly reported a transient or stale status — Nancy's runs at
+ * Privileged Escalation hit this without anyone actually cancelling them
+ * (FAR-107).  Other terminal statuses (`succeeded`/`failed`/`completed`)
+ * are unreachable in practice while the adapter is still executing
+ * (the adapter's own return is what flips them) and even if observed,
+ * they do not warrant our deleting a Job that may still be doing work.
+ * Exported for unit tests.
+ */
+export declare function shouldAbortForCancellation(runStatus: string | undefined): boolean;
+/**
  * Build the error message when Claude's stdout contains no result event.
  * Skips system/init event lines so the UI doesn't display the raw init JSON.
+ * When `podState` is provided, appends the K8s container terminated reason/
+ * message so failures self-explain without requiring `kubectl`.
  * Exported for unit tests.
  */
-export declare function buildPartialRunError(exitCode: number | null, model: string, stdout: string): string;
+export declare function buildPartialRunError(exitCode: number | null, model: string, stdout: string, podState?: PodTerminatedState | null): string;
+export type OrphanClassification = "reattach" | "block_session_mismatch" | "block_task_mismatch" | "block_task_unknown";
 /**
- * Evaluate an orphaned K8s Job (one whose `paperclip.io/run-id` label does
- * not match the current runId) as a potential reattach target.  A Job is
- * reattachable when it belongs to the same agent, same task, and same resume
- * session as the current run — meaning the previous Paperclip instance was
- * mid-stream on the exact piece of work this new run was dispatched to do.
+ * Classify a non-terminal orphaned K8s Job (one whose `paperclip.io/run-id`
+ * label does not match the current runId but does belong to this agent) as a
+ * reattach candidate or a block reason.
+ *
+ * Decision matrix:
+ *   - taskId mismatch (both present, different values)         → block_task_mismatch
+ *   - taskId missing on either side                            → block_task_unknown
+ *   - taskId match + both have sessionId + sessionIds differ   → block_session_mismatch
+ *   - taskId match + one or both sides missing sessionId       → reattach (reconcile)
+ *   - taskId match + both have sessionId + sessionIds match    → reattach (happy path)
+ *
  * Exported for unit tests.
  */
-export declare function isReattachableOrphan(job: k8s.V1Job, expected: {
-    agentId: string;
+export declare function classifyOrphan(job: k8s.V1Job, expected: {
     taskId: string | null;
     sessionId: string | null;
-}): boolean;
+}): OrphanClassification;
 /**
  * Build an error message for a pod that reached phase=Failed before or
  * instead of streaming logs. Includes the claude container's terminated exit
@@ -32,5 +56,33 @@ export declare function isReattachableOrphan(job: k8s.V1Job, expected: {
  * needing kubectl.  Exported for unit tests.
  */
 export declare function describePodTerminatedError(podName: string, phase: string, containerStatuses: k8s.V1ContainerStatus[]): string;
+/**
+ * Get the claude container's terminated state (exit code, reason, message,
+ * signal) from the Job's pod. Returns null if the pod or container is gone.
+ * Used by the no-result error path to explain *why* a run was truncated.
+ */
+export interface PodTerminatedState {
+    exitCode: number | null;
+    reason: string | null;
+    message: string | null;
+    signal: number | null;
+}
+/**
+ * Result of a pod-state lookup.  `state` is the terminated state when available;
+ * `phase` and `podMissing` give the caller enough context to render an honest
+ * truncation-cause message instead of guessing "likely deleted" (FAR-107).
+ */
+export interface PodLookupResult {
+    state: PodTerminatedState | null;
+    phase: string | null;
+    podMissing: boolean;
+}
+/**
+ * Format a human-readable explanation for a truncated run, including the
+ * pod's claude-container terminated state when available. Exit code 137
+ * is annotated as SIGKILL/OOM since that is the most common cause.
+ * Exported for unit tests.
+ */
+export declare function describeTruncationCause(state: PodTerminatedState | null, lookup?: PodLookupResult): string;
 export declare function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
 //# sourceMappingURL=execute.d.ts.map

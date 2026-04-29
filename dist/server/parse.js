@@ -6,9 +6,20 @@ export function parseClaudeStreamJson(stdout) {
     let model = "";
     let finalResult = null;
     const assistantTexts = [];
-    // Belt-and-braces dedup: track seen text blocks to filter duplicates
-    // caused by log stream reconnects replaying overlapping windows.
-    const seenTexts = new Set();
+    // Belt-and-braces dedup: key by (message.id, textIndex) so a session that
+    // legitimately emits the same text twice in different turns isn't collapsed
+    // (finding #11, FAR-15).  The log-dedup filter handles reconnect overlaps
+    // at the line level; this guard only needs to protect against the same
+    // message block being parsed twice.
+    const seenBlocks = new Set();
+    // Set when we see stop_reason:null + output_tokens:0 on an assistant event
+    // with no subsequent result event — indicates the upstream LLM API returned
+    // an empty/malformed response (e.g. MiniMax degraded performance).
+    let llmApiEmptyResponse = false;
+    // Set when an assistant event with output_tokens > 0 was seen but no result
+    // event arrived — indicates the run was truncated mid-stream (pod terminated,
+    // OOMKill, or claude CLI crash after producing content).
+    let assistantContentSeen = false;
     for (const rawLine of stdout.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line)
@@ -25,15 +36,35 @@ export function parseClaudeStreamJson(stdout) {
         if (type === "assistant") {
             sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
             const message = parseObject(event.message);
+            const messageId = asString(message.id, "");
             const content = Array.isArray(message.content) ? message.content : [];
-            for (const entry of content) {
+            // Detect empty LLM API response: stop_reason:null with zero output tokens.
+            // output_tokens may appear directly on message or nested under message.usage.
+            const stopReason = message.stop_reason;
+            const usageObj = parseObject(message.usage);
+            const outputTokens = typeof message.output_tokens === "number"
+                ? message.output_tokens
+                : asNumber(usageObj.output_tokens, -1);
+            if (stopReason === null && outputTokens === 0) {
+                llmApiEmptyResponse = true;
+            }
+            if (outputTokens > 0) {
+                assistantContentSeen = true;
+            }
+            for (let i = 0; i < content.length; i++) {
+                const entry = content[i];
                 if (typeof entry !== "object" || entry === null || Array.isArray(entry))
                     continue;
                 const block = entry;
                 if (asString(block.type, "") === "text") {
                     const text = asString(block.text, "");
-                    if (text && !seenTexts.has(text)) {
-                        seenTexts.add(text);
+                    if (!text)
+                        continue;
+                    // Prefer (messageId, index) when the message has an id; fall back
+                    // to text content when it doesn't (legacy/partial events).
+                    const key = messageId ? `${messageId}:${i}` : `text:${text}`;
+                    if (!seenBlocks.has(key)) {
+                        seenBlocks.add(key);
                         assistantTexts.push(text);
                     }
                 }
@@ -42,6 +73,8 @@ export function parseClaudeStreamJson(stdout) {
         }
         if (type === "result") {
             finalResult = event;
+            llmApiEmptyResponse = false; // result event means Claude completed normally
+            assistantContentSeen = false; // result event means stream was not truncated
             sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
         }
     }
@@ -53,6 +86,8 @@ export function parseClaudeStreamJson(stdout) {
             usage: null,
             summary: assistantTexts.join("\n\n").trim(),
             resultJson: null,
+            llmApiEmptyResponse,
+            truncatedMidStream: assistantContentSeen,
         };
     }
     const usageObj = parseObject(finalResult.usage);
@@ -71,6 +106,8 @@ export function parseClaudeStreamJson(stdout) {
         usage,
         summary,
         resultJson: finalResult,
+        llmApiEmptyResponse: false,
+        truncatedMidStream: false,
     };
 }
 function extractClaudeErrorMessages(parsed) {

@@ -30,6 +30,10 @@ export function createServerAdapter() {
         supportsInstructionsBundle: true,
         instructionsPathKey: "instructionsFilePath",
         requiresMaterializedRuntimeSkills: false,
+        // Tells the reaper to skip local PID checks and use the staleness-based
+        // liveness window instead (adapter spawns K8s Jobs in separate pods).
+        // Cast required: adapter-utils ServerAdapterModule type predates this field.
+        hasOutOfProcessLiveness: true,
         agentConfigurationDoc,
         getConfigSchema,
     };

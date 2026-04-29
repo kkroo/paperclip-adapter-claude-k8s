@@ -1,23 +1,13 @@
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-/**
- * Build the shell command prefix that installs a native Node.js PostToolUse
- * hook into Claude Code's settings.  The hook truncates oversized tool outputs
- * before they reach the model — replacing the RTK binary init-container
- * approach with a self-contained Node.js implementation.
- *
- * Both scripts are base64-encoded so they can be embedded in a sh -c command
- * string without any quoting or escaping issues.
- *
- * @param maxOutputBytes  Byte threshold above which tool output is truncated.
- * @returns               A shell command string (suitable for "&&"-chaining
- *                        before the claude invocation).
- */
-export declare function buildRtkSetupCommands(maxOutputBytes: number): string;
+import type { ClaudePromptBundle } from "./prompt-cache.js";
+export declare function buildPodLogPath(companyId: string, agentId: string, runId: string): string;
 import type { SelfPodInfo } from "./k8s-client.js";
 export interface JobBuildInput {
     ctx: AdapterExecutionContext;
     selfPod: SelfPodInfo;
+    /** Prepared prompt bundle (skills + instructions). When provided, --add-dir and --append-system-prompt-file use bundle paths. */
+    promptBundle?: ClaudePromptBundle | null;
 }
 /** When the prompt exceeds the env-var size limit, the manifest uses a
  *  Secret-backed volume instead of the init container's PROMPT_CONTENT env.
@@ -37,6 +27,10 @@ export interface JobBuildResult {
     /** Non-null when the prompt is too large for an env var and must be
      *  staged as a K8s Secret before creating the Job. */
     promptSecret: PromptSecret | null;
+    /** User-supplied extra labels that were dropped because they used a reserved prefix. */
+    skippedLabels: string[];
+    /** Path to the pod log file on the shared PVC. */
+    podLogPath: string;
 }
 /**
  * Sanitize a string for use as a Kubernetes label value (RFC 1123 subset:

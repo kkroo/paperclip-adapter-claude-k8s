@@ -70,7 +70,11 @@ export async function getSelfPodInfo(kubeconfigPath) {
     if (!spec) {
         throw new Error(`claude_k8s: pod ${hostname} has no spec`);
     }
-    const mainContainer = spec.containers[0];
+    // Match the Paperclip container by name ("paperclip") to avoid service-mesh
+    // sidecars or other injected containers being picked up as the source of
+    // truth for the Job spec (finding #9, FAR-15).  Fall back to the first
+    // container if no name match is found (matches prior behavior).
+    const mainContainer = spec.containers.find((c) => c.name === "paperclip") ?? spec.containers[0];
     if (!mainContainer?.image) {
         throw new Error(`claude_k8s: pod ${hostname} has no container image`);
     }
