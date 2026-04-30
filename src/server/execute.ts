@@ -209,6 +209,31 @@ export function shouldAbortForCancellation(runStatus: string | undefined): boole
  * with a "type" field as protocol artefacts and skipping them.
  * Used by buildPartialRunError to detect init-only runs.
  */
+/**
+ * Linear scan for a `{"type":"result"}` line in raw stdout. Used as a recovery
+ * path when `parseClaudeStreamJson` returns null even though stdout contains
+ * a parseable result event — the streaming parser is sensitive to interleaved
+ * non-JSON lines (e.g. paperclip keepalive prefixes), but the result event
+ * itself is a complete single line we can pluck out and parse standalone.
+ */
+function scanForResultEvent(stdout: string): Record<string, unknown> | null {
+  if (!stdout) return null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line[0] !== "{") continue;
+    if (!line.includes('"type":"result"')) continue;
+    try {
+      const obj = JSON.parse(line) as unknown;
+      if (obj && typeof obj === "object" && (obj as { type?: unknown }).type === "result") {
+        return obj as Record<string, unknown>;
+      }
+    } catch {
+      // keep looking — may be a truncated result line followed by a complete one
+    }
+  }
+  return null;
+}
+
 function firstContentLine(stdout: string): string {
   return stdout.split(/\r?\n/)
     .map((l) => l.trim())
@@ -1363,7 +1388,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const parsedStream = parseClaudeStreamJson(stdout);
-  const parsed = parsedStream.resultJson;
+  let parsed = parsedStream.resultJson;
+
+  // Recovery path for parse failures observed on cephfs RWX. parseClaudeStreamJson
+  // sometimes returns null even when stdout contains a parseable result event —
+  // running theory is interleaved log writes from the keepalive thread on the
+  // same fd, which corrupt the line boundaries the streaming parser relies on
+  // (specifically: a non-result line lands mid-buffer and parseClaudeStreamJson
+  // bails). The 1f79007 cephfs-tail fix guarantees the bytes are on disk; this
+  // recovery does a single linear scan looking for a complete `{"type":"result"}`
+  // line and uses it directly. The parser's stream state (token counts etc.)
+  // is lost in this fallback, but we recover the result + exit metadata which
+  // is enough to keep the run from being marked failed when claude actually
+  // succeeded. Verified live by hand-patching this onto a deployed adapter and
+  // re-running the failing canary — recovered cleanly.
+  if (!parsed) {
+    const recovered = scanForResultEvent(stdout);
+    if (recovered) {
+      await onLog(
+        "stderr",
+        `[paperclip] parseClaudeStreamJson returned null but stdout contains a result event ` +
+          `(subtype=${String((recovered as { subtype?: unknown }).subtype ?? "")}, ` +
+          `is_error=${(recovered as { is_error?: unknown }).is_error === true}); recovering directly.\n`,
+      );
+      parsed = recovered;
+    }
+  }
 
   // If the session was stale, clear it so the next heartbeat starts fresh
   if (parsed && (exitCode ?? 0) !== 0 && isClaudeUnknownSessionError(parsed)) {
