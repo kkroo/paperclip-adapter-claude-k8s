@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 /**
  * Cached self-pod introspection result. Queried once on first execute(),
  * then reused for all subsequent Job builds so every Job inherits the
- * Deployment's image, imagePullSecrets, DNS config, and PVC claim.
+ * Deployment's image, imagePullSecrets, DNS config, PVC claim, and scheduling.
  */
 export interface SelfPodSecretVolume {
   volumeName: string;
@@ -18,6 +18,8 @@ export interface SelfPodInfo {
   image: string;
   imagePullSecrets: Array<{ name: string }>;
   dnsConfig: k8s.V1PodDNSConfig | undefined;
+  nodeSelector: Record<string, string>;
+  tolerations: k8s.V1Toleration[];
   pvcClaimName: string | null;
   secretVolumes: SelfPodSecretVolume[];
   /** Env vars inherited from the Deployment container (literal name/value pairs). */
@@ -86,7 +88,7 @@ function readInClusterNamespace(): string {
 
 /**
  * Query the K8s API for our own pod spec and cache the result.
- * Extracts image, imagePullSecrets, dnsConfig, PVC claim name,
+ * Extracts image, imagePullSecrets, dnsConfig, scheduling, PVC claim name,
  * and environment variables to forward to Job pods.
  */
 export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodInfo> {
@@ -165,6 +167,8 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
       name: s.name ?? "",
     })).filter((s) => s.name.length > 0),
     dnsConfig: spec.dnsConfig,
+    nodeSelector: { ...(spec.nodeSelector ?? {}) },
+    tolerations: [...(spec.tolerations ?? [])],
     pvcClaimName,
     secretVolumes,
     inheritedEnv,

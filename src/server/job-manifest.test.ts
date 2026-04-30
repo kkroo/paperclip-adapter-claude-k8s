@@ -21,6 +21,8 @@ function makeSelfPod(overrides: Partial<SelfPodInfo> = {}): SelfPodInfo {
     image: "paperclipai/paperclip:latest",
     imagePullSecrets: [{ name: "regcred" }],
     dnsConfig: undefined,
+    nodeSelector: {},
+    tolerations: [],
     pvcClaimName: "paperclip-data",
     secretVolumes: [],
     inheritedEnv: {},
@@ -550,6 +552,30 @@ describe("buildJobManifest", () => {
 
     it("omits tolerations when empty", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.tolerations).toBeUndefined();
+    });
+
+    it("inherits nodeSelector from the paperclip pod by default", () => {
+      selfPod = makeSelfPod({ nodeSelector: { workload: "paperclip" } });
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.nodeSelector).toEqual({ workload: "paperclip" });
+    });
+
+    it("inherits tolerations from the paperclip pod by default", () => {
+      const inherited = [{ key: "dedicated", operator: "Equal", value: "paperclip", effect: "NoSchedule" }];
+      selfPod = makeSelfPod({ tolerations: inherited });
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.tolerations).toEqual(inherited);
+    });
+
+    it("allows explicit empty scheduling config to opt out of inherited scheduling", () => {
+      selfPod = makeSelfPod({
+        nodeSelector: { workload: "paperclip" },
+        tolerations: [{ key: "dedicated", operator: "Equal", value: "paperclip", effect: "NoSchedule" }],
+      });
+      ctx.config = { nodeSelector: "", tolerations: [] };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.nodeSelector).toBeUndefined();
       expect(job.spec?.template?.spec?.tolerations).toBeUndefined();
     });
   });

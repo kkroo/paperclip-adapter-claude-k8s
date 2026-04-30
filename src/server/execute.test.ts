@@ -477,6 +477,8 @@ function makeSelfPodResult() {
     image: "paperclipai/paperclip:latest",
     imagePullSecrets: [],
     dnsConfig: undefined,
+    nodeSelector: {},
+    tolerations: [],
     pvcClaimName: "paperclip-data",
     secretVolumes: [],
     inheritedEnv: {},

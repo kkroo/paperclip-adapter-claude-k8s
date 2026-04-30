@@ -285,8 +285,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const extraArgs = asStringArray(config.extraArgs);
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
-  const nodeSelector = parseKeyValueConfig(config.nodeSelector);
-  const tolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
+  const hasConfigKey = (key: string) => Object.prototype.hasOwnProperty.call(config, key);
+  const configuredNodeSelector = parseKeyValueConfig(config.nodeSelector);
+  const nodeSelector = hasConfigKey("nodeSelector") ? configuredNodeSelector : selfPod.nodeSelector;
+  const configuredTolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
+  const tolerations = hasConfigKey("tolerations") ? configuredTolerations : selfPod.tolerations;
   const extraLabels = parseKeyValueConfig(config.labels);
 
   // Resolve working directory — use workspace cwd, fall back to /paperclip
