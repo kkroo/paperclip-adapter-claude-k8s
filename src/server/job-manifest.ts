@@ -23,7 +23,7 @@ function sanitizeForK8sPath(value: string): string {
 }
 
 export function buildPodLogPath(companyId: string, agentId: string, runId: string): string {
-  return `/paperclip/instances/default/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
+  return `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
 }
 
 /** Prompts above this size (bytes) are staged via a Secret instead of an
@@ -523,7 +523,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         name: "write-prompt",
         image: "busybox:1.36",
         imagePullPolicy: "IfNotPresent",
-        command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${agent.companyId}/${agent.id} && cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt`],
+        command: ["sh", "-c", "cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"],
         volumeMounts: [
           { name: "data", mountPath: "/paperclip" },
           { name: "prompt", mountPath: "/tmp/prompt" },
@@ -539,7 +539,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         name: "write-prompt",
         image: "busybox:1.36",
         imagePullPolicy: "IfNotPresent",
-        command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${agent.companyId}/${agent.id} && printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`],
+        command: ["sh", "-c", `printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`],
         env: [{ name: "PROMPT_CONTENT", value: prompt }],
         volumeMounts: [
           { name: "data", mountPath: "/paperclip" },
