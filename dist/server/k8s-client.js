@@ -53,7 +53,7 @@ function readInClusterNamespace() {
 }
 /**
  * Query the K8s API for our own pod spec and cache the result.
- * Extracts image, imagePullSecrets, dnsConfig, PVC claim name,
+ * Extracts image, imagePullSecrets, dnsConfig, scheduling, PVC claim name,
  * and environment variables to forward to Job pods.
  */
 export async function getSelfPodInfo(kubeconfigPath) {
@@ -124,6 +124,8 @@ export async function getSelfPodInfo(kubeconfigPath) {
             name: s.name ?? "",
         })).filter((s) => s.name.length > 0),
         dnsConfig: spec.dnsConfig,
+        nodeSelector: { ...(spec.nodeSelector ?? {}) },
+        tolerations: [...(spec.tolerations ?? [])],
         pvcClaimName,
         secretVolumes,
         inheritedEnv,

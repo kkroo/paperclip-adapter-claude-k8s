@@ -925,3 +925,62 @@ describe("sanitizeLabelValue", () => {
     expect(sanitizeLabelValue("   ")).toBeNull();
   });
 });
+
+describe("per-agent mcp.json layering", () => {
+  let ctx: AdapterExecutionContext;
+  let selfPod: SelfPodInfo;
+
+  beforeEach(() => {
+    ctx = makeCtx();
+    selfPod = makeSelfPod();
+  });
+
+  it("does not inject --mcp-config when adapterConfig.mcpServers is empty", () => {
+    const { claudeArgs, job } = buildJobManifest({ ctx, selfPod });
+    expect(claudeArgs).not.toContain("--mcp-config");
+    expect(claudeArgs).not.toContain("--strict-mcp-config");
+    const init = job.spec!.template.spec!.initContainers![0];
+    const initEnvNames = (init.env ?? []).map((e) => e.name);
+    expect(initEnvNames).not.toContain("MCP_CONFIG");
+  });
+
+  it("merges per-agent overrides on top of the shared baseline and ships --mcp-config + --strict-mcp-config", () => {
+    ctx = makeCtx({
+      config: {
+        mcpServers: {
+          kubernetes: {
+            type: "sse",
+            url: "http://kubernetes-mcp-server-admin.paperclip.svc.cluster.local:8080/sse",
+          },
+          figma: {
+            type: "http",
+            url: "http://figma-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+          },
+        },
+      },
+    });
+    const { claudeArgs, job } = buildJobManifest({ ctx, selfPod });
+    expect(claudeArgs).toContain("--mcp-config");
+    expect(claudeArgs).toContain("/tmp/prompt/mcp.json");
+    expect(claudeArgs).toContain("--strict-mcp-config");
+
+    const init = job.spec!.template.spec!.initContainers![0];
+    const mcpEnv = (init.env ?? []).find((e) => e.name === "MCP_CONFIG");
+    expect(mcpEnv).toBeDefined();
+    const parsed = JSON.parse(mcpEnv!.value!) as {
+      mcpServers: Record<string, { type?: string; url?: string }>;
+    };
+    // Per-agent overrides land verbatim
+    expect(parsed.mcpServers.kubernetes).toEqual({
+      type: "sse",
+      url: "http://kubernetes-mcp-server-admin.paperclip.svc.cluster.local:8080/sse",
+    });
+    expect(parsed.mcpServers.figma).toEqual({
+      type: "http",
+      url: "http://figma-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+    });
+    // The init shell command writes the file to the prompt emptyDir
+    const initCmd = (init.command ?? []).join(" ");
+    expect(initCmd).toContain('printf \'%s\' "$MCP_CONFIG" > /tmp/prompt/mcp.json');
+  });
+});

@@ -1,5 +1,30 @@
 import { asString, asNumber, asBoolean, asStringArray, parseObject, buildPaperclipEnv, renderTemplate, } from "@paperclipai/adapter-utils/server-utils";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+/**
+ * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
+ * writes on every pod start. The adapter runs inside the paperclip
+ * StatefulSet pod, which mounts the same /paperclip PVC the Job pods will
+ * mount, so reading this path here gives us the exact baseline the Job
+ * pod would otherwise inherit. Read lazily (only when an agent actually
+ * supplies adapterConfig.mcpServers) so the adapter does not require the
+ * file to exist for normal operation — and so unit tests don't blow up.
+ */
+const SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
+function loadSharedMcpBaseline() {
+    try {
+        const raw = readFileSync(SHARED_MCP_BASELINE_PATH, "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && parsed.mcpServers && typeof parsed.mcpServers === "object") {
+            return parsed.mcpServers;
+        }
+    }
+    catch {
+        // Missing / unreadable / malformed baseline → start from empty.
+        // Per-agent overrides alone are still a valid mcp.json.
+    }
+    return {};
+}
 function assertSafePathComponent(field, value) {
     if (!/^[a-zA-Z0-9-]+$/.test(value)) {
         throw new Error(`Invalid ${field} for log path: ${value}`);
@@ -9,7 +34,7 @@ function sanitizeForK8sPath(value) {
     return value.replace(/[^a-zA-Z0-9-]/g, "");
 }
 export function buildPodLogPath(companyId, agentId, runId) {
-    return `/paperclip/instances/default/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
+    return `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
 }
 /** Prompts above this size (bytes) are staged via a Secret instead of an
  *  init container env var, protecting against the ~1 MiB PodSpec limit. */
@@ -178,6 +203,10 @@ function buildEnvVars(ctx, selfPod, config) {
     if (selfPod.inheritedEnv.PAPERCLIP_API_URL) {
         paperclipEnv.PAPERCLIP_API_URL = selfPod.inheritedEnv.PAPERCLIP_API_URL;
     }
+    // PAPERCLIP_AGENT_ID and PAPERCLIP_COMPANY_ID come from buildPaperclipEnv.
+    // PAPERCLIP_RUN_ID is set above. Together they form the runContext that
+    // the bundled paperclip-mcp-server stdio bridge uses to authenticate
+    // /plugins/tools/execute calls when an agent invokes a plugin tool via MCP.
     // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.)
     const merged = {
         ...selfPod.inheritedEnv,
@@ -221,8 +250,11 @@ export function buildJobManifest(input) {
     const extraArgs = asStringArray(config.extraArgs);
     const timeoutSec = asNumber(config.timeoutSec, 0);
     const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
-    const nodeSelector = parseKeyValueConfig(config.nodeSelector);
-    const tolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
+    const hasConfigKey = (key) => Object.prototype.hasOwnProperty.call(config, key);
+    const configuredNodeSelector = parseKeyValueConfig(config.nodeSelector);
+    const nodeSelector = hasConfigKey("nodeSelector") ? configuredNodeSelector : selfPod.nodeSelector;
+    const configuredTolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
+    const tolerations = hasConfigKey("tolerations") ? configuredTolerations : selfPod.tolerations;
     const extraLabels = parseKeyValueConfig(config.labels);
     // Resolve working directory — use workspace cwd, fall back to /paperclip
     const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -270,6 +302,25 @@ export function buildJobManifest(input) {
         sessionHandoffChars: sessionHandoffNote.length,
         heartbeatPromptChars: renderedPrompt.length,
     };
+    // Per-agent MCP layering — adapterConfig.mcpServers is a map of
+    // server-name → MCP server spec ({command, args, env, ...} for stdio
+    // or {type: "http"|"sse", url} for transport-typed entries).
+    // When set, we merge with the shared baseline at /paperclip/.mcp.json
+    // (paperclip + prometheus + tempo + kubernetes-readonly + github,
+    // written by the helm chart's seed-init) and ship the result with
+    // claude --mcp-config + --strict-mcp-config so the agent gets exactly
+    // the merged set with no surprise reads from disk.
+    // Spread semantics: per-agent entries override baseline by name; new
+    // entries are added. To swap kubernetes-readonly for ns-rw or admin,
+    // override the "kubernetes" key. To add figma, set a new "figma" key.
+    const perAgentMcpServers = parseObject(config.mcpServers);
+    const hasPerAgentMcp = Object.keys(perAgentMcpServers).length > 0;
+    let mergedMcpJson = null;
+    if (hasPerAgentMcp) {
+        const baseline = loadSharedMcpBaseline();
+        const merged = { ...baseline, ...perAgentMcpServers };
+        mergedMcpJson = JSON.stringify({ mcpServers: merged });
+    }
     // Build Claude CLI args
     // Prefer the bundle's materialized instructions file over the raw config path.
     // Never inject --append-system-prompt-file on session resumes — the instructions
@@ -292,6 +343,14 @@ export function buildJobManifest(input) {
     }
     if (promptBundle)
         claudeArgs.push("--add-dir", promptBundle.addDir);
+    if (mergedMcpJson) {
+        // --strict-mcp-config makes claude ignore the project-scope file at
+        // workingDir/.mcp.json and use ONLY the file we materialize below.
+        // Without it, claude would still read /paperclip/.mcp.json and merge
+        // it on top of ours — losing per-agent overrides like kubernetes
+        // ns-rw replacing readonly, since the project-scope file would win.
+        claudeArgs.push("--mcp-config", "/tmp/prompt/mcp.json", "--strict-mcp-config");
+    }
     if (extraArgs.length > 0)
         claudeArgs.push(...extraArgs);
     // Build env vars
@@ -444,39 +503,45 @@ export function buildJobManifest(input) {
             secret: { secretName: promptSecretName, optional: false },
         });
     }
-    const initContainer = useLargePromptPath
-        ? {
-            name: "write-prompt",
-            image: "busybox:1.36",
-            imagePullPolicy: "IfNotPresent",
-            command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${agent.companyId}/${agent.id} && cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt`],
-            volumeMounts: [
-                { name: "data", mountPath: "/paperclip" },
-                { name: "prompt", mountPath: "/tmp/prompt" },
-                { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
-            ],
-            securityContext,
-            resources: {
-                requests: { cpu: "10m", memory: "16Mi" },
-                limits: { cpu: "100m", memory: "64Mi" },
-            },
-        }
-        : {
-            name: "write-prompt",
-            image: "busybox:1.36",
-            imagePullPolicy: "IfNotPresent",
-            command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${agent.companyId}/${agent.id} && printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`],
-            env: [{ name: "PROMPT_CONTENT", value: prompt }],
-            volumeMounts: [
-                { name: "data", mountPath: "/paperclip" },
-                { name: "prompt", mountPath: "/tmp/prompt" },
-            ],
-            securityContext,
-            resources: {
-                requests: { cpu: "10m", memory: "16Mi" },
-                limits: { cpu: "100m", memory: "64Mi" },
-            },
-        };
+    // Build the init container — writes the prompt (always) and, when an
+    // agent supplied adapterConfig.mcpServers, the merged mcp.json next to
+    // it in the same prompt emptyDir. mcp.json is small (~few kB) so the
+    // env-var path is fine even when the prompt itself goes the
+    // Secret-volume route for size.
+    const initCommandParts = useLargePromptPath
+        ? ["cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"]
+        : [`printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`];
+    const initEnv = useLargePromptPath
+        ? []
+        : [{ name: "PROMPT_CONTENT", value: prompt }];
+    if (mergedMcpJson) {
+        initCommandParts.push(`printf '%s' "$MCP_CONFIG" > /tmp/prompt/mcp.json`);
+        initEnv.push({ name: "MCP_CONFIG", value: mergedMcpJson });
+    }
+    const initVolumeMounts = [
+        { name: "data", mountPath: "/paperclip" },
+        { name: "prompt", mountPath: "/tmp/prompt" },
+    ];
+    if (useLargePromptPath) {
+        initVolumeMounts.push({
+            name: "prompt-secret",
+            mountPath: "/tmp/prompt-secret",
+            readOnly: true,
+        });
+    }
+    const initContainer = {
+        name: "write-prompt",
+        image: "busybox:1.36",
+        imagePullPolicy: "IfNotPresent",
+        command: ["sh", "-c", initCommandParts.join("; ")],
+        ...(initEnv.length > 0 ? { env: initEnv } : {}),
+        volumeMounts: initVolumeMounts,
+        securityContext,
+        resources: {
+            requests: { cpu: "10m", memory: "16Mi" },
+            limits: { cpu: "100m", memory: "64Mi" },
+        },
+    };
     const job = {
         apiVersion: "batch/v1",
         kind: "Job",
