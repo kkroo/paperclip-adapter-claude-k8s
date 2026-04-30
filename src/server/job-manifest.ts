@@ -480,11 +480,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // access token (claude OAuth tokens last ~30-60 min and the paperclip pod
   // doesn't refresh them automatically — that's ccrotate's job). Without this,
   // claude in the Job pod fails with `401 Invalid authentication credentials`
-  // whenever the cached token is older than its expiresAt. Failure is
-  // non-fatal: if ccrotate isn't on PATH or no base-tier account is available,
-  // we still try claude with whatever credentials are on disk so the operator
-  // gets a meaningful 401-from-claude instead of an opaque init failure.
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --target claude >/dev/null 2>&1) || true`;
+  // whenever the cached token is older than its expiresAt.
+  //
+  // `snap --force` first so the current account's just-refreshed tokens get
+  // saved back to the profile (cron-equivalent of the Stop hook). `next --yes`
+  // then rotates: --yes is required because Job pods have no stdin, so without
+  // it ccrotate prompts and hangs/exits when all accounts are at extra usage.
+  // Failure is non-fatal: if ccrotate isn't on PATH or all accounts are
+  // exhausted, we still try claude with whatever credentials are on disk so
+  // the operator gets a meaningful 401-from-claude instead of an opaque init
+  // failure.
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate snap --force --target claude >/dev/null 2>&1; ccrotate next --yes --target claude >/dev/null 2>&1) || true`;
   const claudeInvocation = `${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
   const mainCommand = claudeInvocation;
 
