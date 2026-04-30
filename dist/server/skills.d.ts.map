@@ -1,0 +1,1 @@
+{"version":3,"file":"skills.d.ts","sourceRoot":"","sources":["../../src/server/skills.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EACV,mBAAmB,EACnB,oBAAoB,EAErB,MAAM,4BAA4B,CAAC;AAuFpC,wBAAsB,aAAa,CAAC,GAAG,EAAE,mBAAmB,GAAG,OAAO,CAAC,oBAAoB,CAAC,CAE3F;AAED,wBAAsB,aAAa,CACjC,GAAG,EAAE,mBAAmB,EACxB,cAAc,EAAE,MAAM,EAAE,GACvB,OAAO,CAAC,oBAAoB,CAAC,CAE/B"}

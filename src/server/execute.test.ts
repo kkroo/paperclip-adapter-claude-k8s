@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
+import { readFile } from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 // All K8s API mock functions — declared before vi.mock() so the factory can
@@ -505,6 +506,14 @@ const CLAUDE_HAPPY_OUTPUT = [
     total_cost_usd: 0.001,
   }),
 ].join("\n") + "\n";
+
+describe("execute: stdout accumulator regression", () => {
+  it("assigns the captured pod log to the outer stdout used by the parser", async () => {
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/\n\s*stdout = tailResult\.status === "fulfilled" \? tailResult\.value : "";/);
+    expect(source).not.toMatch(/\n\s*let stdout = tailResult\.status === "fulfilled" \? tailResult\.value : "";/);
+  });
+});
 
 // ─── execute: concurrency guard paths ────────────────────────────────────────
 

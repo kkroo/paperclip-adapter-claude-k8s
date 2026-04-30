@@ -205,11 +205,6 @@ export function shouldAbortForCancellation(runStatus: string | undefined): boole
 }
 
 /**
- * Returns the first non-JSON/plain-text line in stdout, treating JSON objects
- * with a "type" field as protocol artefacts and skipping them.
- * Used by buildPartialRunError to detect init-only runs.
- */
-/**
  * Linear scan for a `{"type":"result"}` line in raw stdout. Used as a recovery
  * path when `parseClaudeStreamJson` returns null even though stdout contains
  * a parseable result event — the streaming parser is sensitive to interleaved
@@ -234,6 +229,11 @@ function scanForResultEvent(stdout: string): Record<string, unknown> | null {
   return null;
 }
 
+/**
+ * Returns the first non-JSON/plain-text line in stdout, treating JSON objects
+ * with a "type" field as protocol artefacts and skipping them.
+ * Used by buildPartialRunError to detect init-only runs.
+ */
 function firstContentLine(stdout: string): string {
   return stdout.split(/\r?\n/)
     .map((l) => l.trim())
@@ -1284,7 +1284,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath, jobObserver).then(r => { logStopSignal.stopped = true; return r; }),
     ]);
 
-    let stdout = tailResult.status === "fulfilled" ? tailResult.value : "";
+    stdout = tailResult.status === "fulfilled" ? tailResult.value : "";
 
     // Belt-and-braces: tailPodLogFile's drain can still miss the trailing
     // `result` line on cephfs RWX when metadata propagation lags Job
@@ -1390,18 +1390,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const parsedStream = parseClaudeStreamJson(stdout);
   let parsed = parsedStream.resultJson;
 
-  // Recovery path for parse failures observed on cephfs RWX. parseClaudeStreamJson
-  // sometimes returns null even when stdout contains a parseable result event —
-  // running theory is interleaved log writes from the keepalive thread on the
-  // same fd, which corrupt the line boundaries the streaming parser relies on
-  // (specifically: a non-result line lands mid-buffer and parseClaudeStreamJson
-  // bails). The 1f79007 cephfs-tail fix guarantees the bytes are on disk; this
-  // recovery does a single linear scan looking for a complete `{"type":"result"}`
-  // line and uses it directly. The parser's stream state (token counts etc.)
-  // is lost in this fallback, but we recover the result + exit metadata which
-  // is enough to keep the run from being marked failed when claude actually
-  // succeeded. Verified live by hand-patching this onto a deployed adapter and
-  // re-running the failing canary — recovered cleanly.
+  // Recovery path for malformed or partially duplicated streams: if a complete
+  // result event is present as its own line, preserve the successful run rather
+  // than reporting a parser failure.
   if (!parsed) {
     const recovered = scanForResultEvent(stdout);
     if (recovered) {
