@@ -492,7 +492,12 @@ export function buildJobManifest(input) {
     // credentials are on disk so the operator gets a meaningful
     // 401-from-claude instead of an opaque init failure.
     const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude >/dev/null 2>&1) || true`;
-    const claudeInvocation = `${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
+    // `set -o pipefail` so a claude binary crash (OOM, segfault, missing-bin)
+    // surfaces as a non-zero shell exit code instead of being masked by tee's
+    // exit code. Without pipefail the pod marks Succeeded even when claude
+    // never emits any stream-json — paperclip-server's parser only catches
+    // type:error events from inside the JSON stream, not pre-stream crashes.
+    const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
     const mainCommand = claudeInvocation;
     // Decide prompt delivery strategy: env var (small) or Secret volume (large).
     const promptBytes = Buffer.byteLength(prompt, "utf-8");

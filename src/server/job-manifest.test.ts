@@ -838,7 +838,7 @@ describe("buildJobManifest", () => {
       // claude-code's Stop hook handles end-of-session snap and pre-snap
       // raced with another concurrent Job's `next` mid-write — see
       // ccrotateRefresh comment). Then plain `cat ... | claude ... | tee ...`.
-      expect(cmd?.[2]).toMatch(/^\(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee /);
+      expect(cmd?.[2]).toMatch(/^set -o pipefail; \(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee /);
       expect(cmd?.[2]).not.toContain("ccrotate snap");
       expect(cmd?.[2]).not.toContain("rtk-filter");
     });
