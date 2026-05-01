@@ -299,6 +299,61 @@ function buildEnvVars(
   return envVars;
 }
 
+/**
+ * docker:dind sidecar exposing /var/run/docker.sock to the agent container
+ * via a shared emptyDir. Deployed as a native Kubernetes 1.29+ sidecar
+ * (initContainer with restartPolicy: "Always"): starts before the main
+ * container, lives for the duration of the Job, terminates when main exits.
+ *
+ * Privileged because dockerd needs cgroups + devices. The cluster does not
+ * enforce PodSecurityStandards (see the k8s repo's
+ * feedback_pss_enforcement.md), so a privileged Pod is acceptable for
+ * opt-in agent toolchain use.
+ *
+ * DOCKER_TLS_CERTDIR="" disables dockerd's auto-TLS bootstrap — traffic
+ * stays on the unix socket inside the pod network namespace, no TCP
+ * exposure, no TLS handshakes adding to startup time.
+ */
+function buildDindSidecar(opts: {
+  image: string;
+  cpuLimit: string;
+  memoryLimit: string;
+}): k8s.V1Container {
+  // restartPolicy: "Always" on an init container is the native sidecar
+  // pattern (k8s 1.29 GA, 1.28 beta). The @kubernetes/client-node
+  // V1Container type predates this addition, so we declare an intersection
+  // type that adds the field instead of any-casting the whole container.
+  type SidecarContainer = k8s.V1Container & { restartPolicy?: string };
+  const sidecar: SidecarContainer = {
+    name: "dind",
+    image: opts.image,
+    imagePullPolicy: "IfNotPresent",
+    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"],
+    securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
+    env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
+    resources: {
+      requests: { cpu: "100m", memory: "256Mi" },
+      limits: { cpu: opts.cpuLimit, memory: opts.memoryLimit },
+    },
+    volumeMounts: [
+      { name: "docker-graph", mountPath: "/var/lib/docker" },
+      { name: "docker-sock", mountPath: "/var/run" },
+    ],
+    restartPolicy: "Always",
+  };
+  return sidecar;
+}
+
+/**
+ * Shell snippet the main container prepends to its command when the DinD
+ * sidecar is enabled. Polls for /var/run/docker.sock to appear (sidecar
+ * dockerd needs ~5–15 s to come up) and bails out if it never does, so
+ * agent runs never silently proceed without docker available.
+ */
+const DIND_WAIT_PREAMBLE =
+  `i=0; while [ ! -S /var/run/docker.sock ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; ` +
+  `if [ ! -S /var/run/docker.sock ]; then echo "dind sidecar socket /var/run/docker.sock never appeared after 30s" >&2; exit 1; fi`;
+
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { ctx, selfPod, promptBundle } = input;
   const { runId, agent, runtime, config: rawConfig, context } = ctx;
@@ -307,6 +362,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Resolve config values
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const image = asString(config.image, "") || selfPod.image;
+  const enableDocker = asBoolean(config.enableDocker, false);
+  const dockerImage = asString(config.dockerImage, "docker:28-dind");
+  const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
+  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
@@ -568,7 +627,23 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // never emits any stream-json — paperclip-server's parser only catches
   // type:error events from inside the JSON stream, not pre-stream crashes.
   const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
-  const mainCommand = claudeInvocation;
+  // When the DinD sidecar is wired in, prepend the wait-for-socket loop
+  // so the agent never starts before dockerd is listening on the shared
+  // unix socket. Mirrors the opencode_k8s adapter.
+  const mainCommand = enableDocker ? `${DIND_WAIT_PREAMBLE}; ${claudeInvocation}` : claudeInvocation;
+
+  // Wire the DinD sidecar's shared volumes + DOCKER_HOST env into the main
+  // container. Done after volumes/volumeMounts/envVars are otherwise built
+  // so this is a single localized change, easy to remove if we later move
+  // dockerd to a dedicated pod.
+  if (enableDocker) {
+    volumes.push(
+      { name: "docker-graph", emptyDir: {} },
+      { name: "docker-sock", emptyDir: {} },
+    );
+    volumeMounts.push({ name: "docker-sock", mountPath: "/var/run" });
+    envVars.push({ name: "DOCKER_HOST", value: "unix:///var/run/docker.sock" });
+  }
 
   // Decide prompt delivery strategy: env var (small) or Secret volume (large).
   const promptBytes = Buffer.byteLength(prompt, "utf-8");
@@ -657,7 +732,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           ...(selfPod.dnsConfig ? { dnsConfig: selfPod.dnsConfig } : {}),
           ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector } : {}),
           ...(tolerations.length > 0 ? { tolerations: tolerations as k8s.V1Toleration[] } : {}),
-          initContainers: [initContainer],
+          initContainers: [
+            initContainer,
+            ...(enableDocker
+              ? [buildDindSidecar({ image: dockerImage, cpuLimit: dockerCpuLimit, memoryLimit: dockerMemoryLimit })]
+              : []),
+          ],
           containers: [
             {
               name: "claude",

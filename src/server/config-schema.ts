@@ -133,6 +133,35 @@ export function getConfigSchema(): AdapterConfigSchema {
       label: "Labels",
       hint: "Extra labels added to Job metadata. One key=value per line.",
     },
+    // Docker-in-Docker sidecar — opt-in. When enabled, a docker:dind
+    // sidecar runs alongside the agent container and exposes
+    // /var/run/docker.sock to it. Required for `docker build`,
+    // `kind create cluster`, and similar tooling. Pod becomes privileged.
+    {
+      type: "toggle",
+      key: "enableDocker",
+      label: "Enable Docker (DinD sidecar)",
+      default: false,
+      hint: "Add a docker:dind sidecar that exposes /var/run/docker.sock to the agent. Required for `docker build` and `kind create cluster`. Pod becomes privileged.",
+    },
+    {
+      type: "text",
+      key: "dockerImage",
+      label: "DinD Image",
+      hint: "Container image for the DinD sidecar (default docker:28-dind). Only used when Enable Docker is on.",
+    },
+    {
+      type: "text",
+      key: "dockerCpuLimit",
+      label: "DinD CPU Limit",
+      hint: "CPU limit for the DinD sidecar (default '2'). e.g. '2', '4000m'.",
+    },
+    {
+      type: "text",
+      key: "dockerMemoryLimit",
+      label: "DinD Memory Limit",
+      hint: "Memory limit for the DinD sidecar (default '2Gi'). e.g. '2Gi', '4Gi'.",
+    },
   ];
 
   return { fields };
