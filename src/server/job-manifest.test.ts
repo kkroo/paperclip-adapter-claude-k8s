@@ -843,6 +843,17 @@ describe("buildJobManifest", () => {
       expect(cmd?.[2]).not.toContain("rtk-filter");
     });
 
+    it("serializes the ccrotate refresh with flock to avoid concurrent-Job credentials race", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      // ccrotate.js writeClaudeFiles is non-atomic across credentials.json
+      // and config.json; without flock, two pods refreshing at the same
+      // time produced `401 Invalid authentication credentials` from a
+      // partially-written credentials.json.
+      expect(cmd).toContain("command -v flock");
+      expect(cmd).toMatch(/flock --wait 30 \/paperclip\/\.claude\/\.ccrotate\.lock ccrotate next --yes --target claude/);
+    });
+
     it("command includes tee to pod log path", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";

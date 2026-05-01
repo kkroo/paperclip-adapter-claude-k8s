@@ -561,7 +561,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // accounts are exhausted, we still try claude with whatever
   // credentials are on disk so the operator gets a meaningful
   // 401-from-claude instead of an opaque init failure.
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude >/dev/null 2>&1) || true`;
+  //
+  // Serialize via flock(1) on a sibling lockfile because ccrotate.js's
+  // writeClaudeFiles writes credentials.json and config.json in two
+  // non-atomic steps. Concurrent Job pods (e.g. CTO + CEO heartbeats
+  // firing simultaneously) racing the refresh produced 4× `401 Invalid
+  // authentication credentials` failures across CTO + CEO in a 90-second
+  // window during the 2026-05-01 Phase 3 soak audit — one pod read a
+  // partially-written credentials.json. The base image ships util-linux
+  // so flock is always available; mandate it. `--wait 30` keeps the
+  // worst case bounded to 30s even if a holder crashes mid-write.
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 && flock --wait 30 /paperclip/.claude/.ccrotate.lock ccrotate next --yes --target claude >/dev/null 2>&1) || true`;
   // `set -o pipefail` so a claude binary crash (OOM, segfault, missing-bin)
   // surfaces as a non-zero shell exit code instead of being masked by tee's
   // exit code. Without pipefail the pod marks Succeeded even when claude
