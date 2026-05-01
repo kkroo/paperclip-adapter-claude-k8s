@@ -834,8 +834,12 @@ describe("buildJobManifest", () => {
     it("adds ccrotate preflight but does not add rtk when enableRtk is false (default)", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command;
-      // Command should refresh Claude auth, then run the plain `cat ... | claude ... | tee ...` form with no rtk setup.
-      expect(cmd?.[2]).toMatch(/^\(command -v ccrotate .*ccrotate snap .*ccrotate next .*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee /);
+      // Command should refresh Claude auth via `next` only (no pre-snap;
+      // claude-code's Stop hook handles end-of-session snap and pre-snap
+      // raced with another concurrent Job's `next` mid-write — see
+      // ccrotateRefresh comment). Then plain `cat ... | claude ... | tee ...`.
+      expect(cmd?.[2]).toMatch(/^\(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee /);
+      expect(cmd?.[2]).not.toContain("ccrotate snap");
       expect(cmd?.[2]).not.toContain("rtk-filter");
     });
 
