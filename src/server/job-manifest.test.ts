@@ -843,6 +843,40 @@ describe("buildJobManifest", () => {
       expect(cmd?.[2]).not.toContain("rtk-filter");
     });
 
+    it("appends --accounts <csv> to ccrotate next when providers.anthropic.accounts is populated", () => {
+      ctx.config = {
+        providers: {
+          anthropic: {
+            accounts: ["a@b.net", "c@d.net"],
+          },
+        },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(cmd).toContain("ccrotate next --yes --target claude --accounts a@b.net,c@d.net");
+    });
+
+    it("does not add --accounts when providers is undefined (global rotation path)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(cmd).toContain("ccrotate next --yes --target claude");
+      expect(cmd).not.toContain("--accounts");
+    });
+
+    it("does not add --accounts when providers has only openai (wrong key for claude)", () => {
+      ctx.config = {
+        providers: {
+          openai: {
+            accounts: ["x@y.net"],
+          },
+        },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(cmd).toContain("ccrotate next --yes --target claude");
+      expect(cmd).not.toContain("--accounts");
+    });
+
     it("command includes tee to pod log path", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";

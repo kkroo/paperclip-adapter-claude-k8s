@@ -572,7 +572,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // accounts are exhausted, we still try claude with whatever
   // credentials are on disk so the operator gets a meaningful
   // 401-from-claude instead of an opaque init failure.
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude >/dev/null 2>&1) || true`;
+  // When the environment driver supplies a per-env Anthropic account pool
+  // (effectiveConfig.providers.anthropic.accounts, plumbed through
+  // mergeEnvironmentConfig from executionTarget.config), constrain ccrotate's
+  // rotation to just that pool via `--accounts a@b.net,c@d.net`. Absent or
+  // empty pool → the appended segment is the empty string and the command
+  // stays bit-for-bit identical to the global-rotation behavior.
+  const providersConfig = parseObject(config.providers);
+  const anthropicConfig = parseObject(providersConfig.anthropic);
+  const anthropicAccounts = Array.isArray(anthropicConfig.accounts)
+    ? (anthropicConfig.accounts as ReadonlyArray<unknown>).filter(
+        (s): s is string => typeof s === "string" && s.length > 0,
+      )
+    : [];
+  const accountsArg = anthropicAccounts.length > 0 ? ` --accounts ${anthropicAccounts.join(",")}` : "";
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
   // `set -o pipefail` so a claude binary crash (OOM, segfault, missing-bin)
   // surfaces as a non-zero shell exit code instead of being masked by tee's
   // exit code. Without pipefail the pod marks Succeeded even when claude
