@@ -485,15 +485,26 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   ];
 
-  // Mount shared PVC for /paperclip (session state, workspaces, data)
-  if (selfPod.pvcClaimName) {
+  // Mount shared PVC for /paperclip (session state, workspaces, data).
+  //
+  // Phase E.1 — when paperclip's k8s execution target supplies
+  // `workspaceVolumeClaim` / `workspaceMountPath`, those win over the
+  // adapter defaults derived from selfPod.  When unset, retain the
+  // selfPod-derived PVC and the conventional /paperclip mount path.
+  // `effectiveConfig` (built in execute.ts) lands these env-supplied
+  // values into `config.workspaceVolumeClaim` / `config.workspaceMountPath`.
+  const envWorkspaceClaim = asString(config.workspaceVolumeClaim, "").trim();
+  const envWorkspaceMountPath = asString(config.workspaceMountPath, "").trim();
+  const dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || "";
+  const dataMountPath = envWorkspaceMountPath || "/paperclip";
+  if (dataClaimName) {
     volumes.push({
       name: "data",
-      persistentVolumeClaim: { claimName: selfPod.pvcClaimName },
+      persistentVolumeClaim: { claimName: dataClaimName },
     });
     volumeMounts.push({
       name: "data",
-      mountPath: "/paperclip",
+      mountPath: dataMountPath,
     });
   }
 
@@ -607,7 +618,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     initEnv.push({ name: "MCP_CONFIG", value: mergedMcpJson });
   }
   const initVolumeMounts: k8s.V1VolumeMount[] = [
-    { name: "data", mountPath: "/paperclip" },
+    { name: "data", mountPath: dataMountPath },
     { name: "prompt", mountPath: "/tmp/prompt" },
   ];
   if (useLargePromptPath) {

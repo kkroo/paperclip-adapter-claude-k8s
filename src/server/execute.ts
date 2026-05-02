@@ -171,6 +171,29 @@ async function tailPodLogFile(
 }
 
 /**
+ * Merge a paperclip environment's `executionTarget.config` (k8s remote target)
+ * over the agent's adapter config.  Top-level fields only — env wins, and
+ * keys whose env value is `null` / `undefined` are skipped so a partially
+ * filled K8sRemoteSpec doesn't blow away adapter defaults.
+ *
+ * TODO(env-config): once a `@paperclipai/adapter-utils` release exposing
+ * `mergeEnvironmentConfig` is consumable cross-repo, swap this inline copy
+ * for the upstream helper and drop this definition.
+ */
+export function mergeEnvironmentConfig(
+  adapterConfig: Record<string, unknown>,
+  environmentConfig: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (environmentConfig == null) return adapterConfig;
+  const merged: Record<string, unknown> = { ...adapterConfig };
+  for (const [k, v] of Object.entries(environmentConfig)) {
+    if (v == null) continue;
+    merged[k] = v;
+  }
+  return merged;
+}
+
+/**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
  * Works for both v0.x (response.statusCode) and v1.0+ (response.status, message).
  * Exported for unit tests.
@@ -721,10 +744,39 @@ async function cleanupJob(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, runtime, config: rawConfig, onLog, onMeta } = ctx;
-  const config = parseObject(rawConfig);
+  // Phase E.1 — when paperclip dispatches a heartbeat with a remote/k8s
+  // executionTarget, merge `executionTarget.config` (the env's K8sRemoteSpec)
+  // over the agent's adapter_config.  Environment fields win, but keys whose
+  // env value is null/undefined are skipped so a partially filled K8sRemoteSpec
+  // doesn't clobber adapter defaults.  Any other transport (ssh, sandbox) and
+  // local targets fall through to the agent's adapter_config unchanged.
+  // TODO(env-config): plumb cross-namespace secret resolution.  `secretsNamespace`
+  //  is merged through here so it lands in `effectiveConfig`, but downstream
+  //  Secret reads currently always use the Job's own namespace; a future patch
+  //  needs to pass `secretsNamespace` into the Secret-resolution path.
+  const target = (ctx as unknown as { executionTarget?: { kind?: string; transport?: string; config?: Record<string, unknown> } }).executionTarget;
+  const isK8sRemoteTarget = target?.kind === "remote" && target?.transport === "k8s";
+  const adapterConfigObj = parseObject(rawConfig);
+  const effectiveConfig = isK8sRemoteTarget
+    ? mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)
+    : adapterConfigObj;
+  // Build a derived context whose `config` is the merged result so every
+  // downstream call (incl. buildJobManifest) sees the env-supplied fields.
+  const effectiveCtx: AdapterExecutionContext = isK8sRemoteTarget
+    ? ({ ...ctx, config: effectiveConfig } as AdapterExecutionContext)
+    : ctx;
+  const config = effectiveConfig;
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
+  // K8sRemoteSpec.kubeconfig is *content* (resolved by the env driver), but
+  // the adapter's existing config interprets `kubeconfig` as a filesystem
+  // path. When the env supplies null we fall through to in-cluster auth as
+  // today (mergeEnvironmentConfig skips null values, so adapter's
+  // "no kubeconfig" wins → undefined → loadFromCluster).
+  // TODO(env-config): when env supplies non-null kubeconfig content, write
+  //  it to a tmp file and load that path through getKubeConfig() so the
+  //  client uses the env-supplied credential. Out of scope for E.1.
   const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
   const paperclipApiUrl = process.env.PAPERCLIP_API_URL ?? "";
   if (!paperclipApiUrl) {
@@ -985,7 +1037,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   } else {
     // Build Job manifest
-    const built = buildJobManifest({ ctx, selfPod, promptBundle });
+    const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });
     const job = built.job;
     jobName = built.jobName;
     namespace = built.namespace;
