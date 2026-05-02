@@ -170,28 +170,10 @@ async function tailPodLogFile(
   return accumulator.join("\n");
 }
 
-/**
- * Merge a paperclip environment's `executionTarget.config` (k8s remote target)
- * over the agent's adapter config.  Top-level fields only — env wins, and
- * keys whose env value is `null` / `undefined` are skipped so a partially
- * filled K8sRemoteSpec doesn't blow away adapter defaults.
- *
- * TODO(env-config): once a `@paperclipai/adapter-utils` release exposing
- * `mergeEnvironmentConfig` is consumable cross-repo, swap this inline copy
- * for the upstream helper and drop this definition.
- */
-export function mergeEnvironmentConfig(
-  adapterConfig: Record<string, unknown>,
-  environmentConfig: Record<string, unknown> | null | undefined,
-): Record<string, unknown> {
-  if (environmentConfig == null) return adapterConfig;
-  const merged: Record<string, unknown> = { ...adapterConfig };
-  for (const [k, v] of Object.entries(environmentConfig)) {
-    if (v == null) continue;
-    merged[k] = v;
-  }
-  return merged;
-}
+// Single source of truth lives in @paperclipai/adapter-utils. Re-exported
+// so existing test imports (`from "./execute.js"`) keep working.
+import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
+export { mergeEnvironmentConfig };
 
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
