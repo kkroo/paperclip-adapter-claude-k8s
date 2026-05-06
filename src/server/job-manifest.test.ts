@@ -837,10 +837,28 @@ describe("buildJobManifest", () => {
       // Command should refresh Claude auth via `next` only (no pre-snap;
       // claude-code's Stop hook handles end-of-session snap and pre-snap
       // raced with another concurrent Job's `next` mid-write — see
-      // ccrotateRefresh comment). Then plain `cat ... | claude ... | tee ...`.
-      expect(cmd?.[2]).toMatch(/^set -o pipefail; \(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee /);
+      // ccrotateRefresh comment). Then `cat ... | claude ... | tee ... |
+      // <fail-fast awk> > /dev/null` so a terminal rate-limit event
+      // unwinds the pipeline non-zero (RCA 2026-05-06).
+      expect(cmd?.[2]).toMatch(/^set -o pipefail; \(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee .* \| awk .* > \/dev\/null$/);
       expect(cmd?.[2]).not.toContain("ccrotate snap");
       expect(cmd?.[2]).not.toContain("rtk-filter");
+    });
+
+    it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      // Both substring matches must be present in the awk pattern so
+      // we exit only on the specific terminal combination, not on
+      // every `rate_limit_event` (most of which are informational
+      // "allowed" status events with overage available).
+      expect(cmd).toContain('"overageStatus":"rejected"');
+      expect(cmd).toContain('"overageDisabledReason":"out_of_credits"');
+      expect(cmd).toContain("[wrapper] terminal rate-limit");
+      expect(cmd).toContain("exit 1");
+      // Ordering matters — awk must run after `tee` so the trigger
+      // event is persisted to the pod log before pipefail unwinds.
+      expect(cmd.indexOf("tee ")).toBeLessThan(cmd.indexOf("awk "));
     });
 
     it("appends --accounts <csv> to ccrotate next when providers.anthropic.accounts is populated", () => {

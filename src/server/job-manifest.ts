@@ -646,12 +646,29 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     : [];
   const accountsArg = anthropicAccounts.length > 0 ? ` --accounts ${anthropicAccounts.join(",")}` : "";
   const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
+  // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
+  // `rate_limit_event` with `overageStatus:"rejected"` +
+  // `overageDisabledReason:"out_of_credits"` was not a terminal signal to
+  // claude — the CLI keeps the session open and the wrapper sat there
+  // indefinitely (one observed pod hung 20h on this exact event). Watch
+  // the stream for that combination and exit non-zero; SIGPIPE then
+  // unwinds the upstream claude process and pipefail surfaces the
+  // failure. The harness recovery path will retry on a fresh account
+  // when quotas reset, instead of letting a wedged pod consume a slot.
+  //
+  // awk runs after `tee`, so the rate_limit_event line is already
+  // persisted to the pod log before we exit. `fflush()` keeps the awk
+  // pipeline line-buffered (default `gawk`/`mawk` would buffer otherwise
+  // and stream-json events would batch to ~4 KiB before flushing).
+  const failFastFilter =
+    `awk '{ print; fflush() } /\"overageStatus\":\"rejected\"/ && /\"overageDisabledReason\":\"out_of_credits\"/ { print \"[wrapper] terminal rate-limit: out_of_credits overage rejected; exiting non-zero so harness can retry on quota reset\" > \"/dev/stderr\"; exit 1 }'`;
   // `set -o pipefail` so a claude binary crash (OOM, segfault, missing-bin)
-  // surfaces as a non-zero shell exit code instead of being masked by tee's
-  // exit code. Without pipefail the pod marks Succeeded even when claude
-  // never emits any stream-json — paperclip-server's parser only catches
-  // type:error events from inside the JSON stream, not pre-stream crashes.
-  const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
+  // OR the fail-fast awk surfaces as a non-zero shell exit code instead
+  // of being masked by the trailing `cat`'s exit code. Without pipefail
+  // the pod marks Succeeded even when claude never emits any stream-json
+  // — paperclip-server's parser only catches type:error events from
+  // inside the JSON stream, not pre-stream crashes.
+  const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
