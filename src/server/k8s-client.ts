@@ -46,7 +46,24 @@ function getKubeConfig(kubeconfigPath?: string): k8s.KubeConfig {
     if (kubeconfigPath) {
       kc.loadFromFile(kubeconfigPath);
     } else {
-      kc.loadFromCluster();
+      // Bare loadFromCluster() throws ENOENT on
+      // /var/run/secrets/kubernetes.io/serviceaccount/ca.crt when the pod's
+      // ServiceAccount token isn't mounted. That message buried the real
+      // misconfiguration (Helm serviceAccount.automountToken=false) in
+      // adapter logs, so swap it for an actionable error.
+      if (!process.env.KUBERNETES_SERVICE_HOST) {
+        throw new Error(
+          "claude_k8s: in-cluster auth unavailable — KUBERNETES_SERVICE_HOST is unset (not running in a Kubernetes pod) and no kubeconfig path was provided",
+        );
+      }
+      try {
+        kc.loadFromCluster();
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `claude_k8s: failed to load in-cluster kubeconfig — the pod's ServiceAccount token is not mounted (set Helm serviceAccount.automountToken=true and rbac.create=true). Underlying error: ${cause}`,
+        );
+      }
     }
     kcCache.set(key, kc);
   }
