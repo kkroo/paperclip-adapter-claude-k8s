@@ -136,6 +136,10 @@ async function tailPodLogFile(filePath, opts) {
     }
     return accumulator.join("\n");
 }
+// Single source of truth lives in @paperclipai/adapter-utils. Re-exported
+// so existing test imports (`from "./execute.js"`) keep working.
+import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
+export { mergeEnvironmentConfig };
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
  * Works for both v0.x (response.statusCode) and v1.0+ (response.status, message).
@@ -596,10 +600,39 @@ async function cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)
 }
 export async function execute(ctx) {
     const { runId, runtime, config: rawConfig, onLog, onMeta } = ctx;
-    const config = parseObject(rawConfig);
+    // Phase E.1 — when paperclip dispatches a heartbeat with a remote/k8s
+    // executionTarget, merge `executionTarget.config` (the env's K8sRemoteSpec)
+    // over the agent's adapter_config.  Environment fields win, but keys whose
+    // env value is null/undefined are skipped so a partially filled K8sRemoteSpec
+    // doesn't clobber adapter defaults.  Any other transport (ssh, sandbox) and
+    // local targets fall through to the agent's adapter_config unchanged.
+    // TODO(env-config): plumb cross-namespace secret resolution.  `secretsNamespace`
+    //  is merged through here so it lands in `effectiveConfig`, but downstream
+    //  Secret reads currently always use the Job's own namespace; a future patch
+    //  needs to pass `secretsNamespace` into the Secret-resolution path.
+    const target = ctx.executionTarget;
+    const isK8sRemoteTarget = target?.kind === "remote" && target?.transport === "k8s";
+    const adapterConfigObj = parseObject(rawConfig);
+    const effectiveConfig = isK8sRemoteTarget
+        ? mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)
+        : adapterConfigObj;
+    // Build a derived context whose `config` is the merged result so every
+    // downstream call (incl. buildJobManifest) sees the env-supplied fields.
+    const effectiveCtx = isK8sRemoteTarget
+        ? { ...ctx, config: effectiveConfig }
+        : ctx;
+    const config = effectiveConfig;
     const timeoutSec = asNumber(config.timeoutSec, 0);
     const graceSec = asNumber(config.graceSec, 60);
     const retainJobs = asBoolean(config.retainJobs, false);
+    // K8sRemoteSpec.kubeconfig is *content* (resolved by the env driver), but
+    // the adapter's existing config interprets `kubeconfig` as a filesystem
+    // path. When the env supplies null we fall through to in-cluster auth as
+    // today (mergeEnvironmentConfig skips null values, so adapter's
+    // "no kubeconfig" wins → undefined → loadFromCluster).
+    // TODO(env-config): when env supplies non-null kubeconfig content, write
+    //  it to a tmp file and load that path through getKubeConfig() so the
+    //  client uses the env-supplied credential. Out of scope for E.1.
     const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
     const paperclipApiUrl = process.env.PAPERCLIP_API_URL ?? "";
     if (!paperclipApiUrl) {
@@ -845,7 +878,7 @@ export async function execute(ctx) {
         }
         else {
             // Build Job manifest
-            const built = buildJobManifest({ ctx, selfPod, promptBundle });
+            const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });
             const job = built.job;
             jobName = built.jobName;
             namespace = built.namespace;
@@ -1382,13 +1415,33 @@ export async function execute(ctx) {
         }
         : null;
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
+    // Trust the SDK's explicit success signal over the K8s pod's exit code.
+    // The job-manifest.ts wrapper pipes stream-json through a `tee | awk` chain
+    // that fires `exit 1` on a `rate_limit_event` with overage rejected (RCA
+    // 2026-05-06 fix for hung pods). When claude actually finishes its work
+    // before that event triggers (or even when it finishes despite the trigger,
+    // because the SIGPIPE takes time to unwind through stdio buffers), the
+    // resulting pod exit-code-1 is just wrapper noise — the agent already
+    // emitted `{type:"result", subtype:"success", is_error:false}` and the
+    // work landed. Trusting exit code over the SDK signal classifies these as
+    // adapter_failed and re-queues already-completed work, burning pool budget.
+    //
+    // When `is_error: true` (the SDK's actual failure flag — quota, rate-limit,
+    // transient upstream) we still mark failed regardless of subtype. When the
+    // wrapper exit-1 fires AND claude truly hung (no subtype=success in the
+    // stream), parsed.subtype will not be "success" so this falls through to
+    // the existing failed path. Mirror of paperclip#125 in the claude-local
+    // adapter.
+    const parsedIsError = asBoolean(parsed.is_error, false);
+    const claudeReportedSuccess = asString(parsed.subtype, "") === "success" && !parsedIsError;
+    const failed = parsedIsError || ((exitCode ?? 0) !== 0 && !claudeReportedSuccess);
     return {
         exitCode,
         signal: null,
         timedOut: false,
-        errorMessage: (exitCode ?? 0) === 0
-            ? null
-            : describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`,
+        errorMessage: failed
+            ? describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`
+            : null,
         usage,
         sessionId: resolvedSessionId || null,
         sessionParams: resolvedSessionParams,

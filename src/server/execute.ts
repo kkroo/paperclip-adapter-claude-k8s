@@ -1567,14 +1567,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
 
+  // Trust the SDK's explicit success signal over the K8s pod's exit code.
+  // The job-manifest.ts wrapper pipes stream-json through a `tee | awk` chain
+  // that fires `exit 1` on a `rate_limit_event` with overage rejected (RCA
+  // 2026-05-06 fix for hung pods). When claude actually finishes its work
+  // before that event triggers (or even when it finishes despite the trigger,
+  // because the SIGPIPE takes time to unwind through stdio buffers), the
+  // resulting pod exit-code-1 is just wrapper noise — the agent already
+  // emitted `{type:"result", subtype:"success", is_error:false}` and the
+  // work landed. Trusting exit code over the SDK signal classifies these as
+  // adapter_failed and re-queues already-completed work, burning pool budget.
+  //
+  // When `is_error: true` (the SDK's actual failure flag — quota, rate-limit,
+  // transient upstream) we still mark failed regardless of subtype. When the
+  // wrapper exit-1 fires AND claude truly hung (no subtype=success in the
+  // stream), parsed.subtype will not be "success" so this falls through to
+  // the existing failed path. Mirror of paperclip#125 in the claude-local
+  // adapter.
+  const parsedIsError = asBoolean(parsed.is_error, false);
+  const claudeReportedSuccess =
+    asString(parsed.subtype as string, "") === "success" && !parsedIsError;
+  const failed =
+    parsedIsError || ((exitCode ?? 0) !== 0 && !claudeReportedSuccess);
+
   return {
     exitCode,
     signal: null,
     timedOut: false,
-    errorMessage:
-      (exitCode ?? 0) === 0
-        ? null
-        : describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`,
+    errorMessage: failed
+      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`
+      : null,
     usage,
     sessionId: resolvedSessionId || null,
     sessionParams: resolvedSessionParams,

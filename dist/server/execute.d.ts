@@ -1,5 +1,7 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type * as k8s from "@kubernetes/client-node";
+import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
+export { mergeEnvironmentConfig };
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
  * Works for both v0.x (response.statusCode) and v1.0+ (response.status, message).
