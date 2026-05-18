@@ -1040,3 +1040,131 @@ describe("per-agent mcp.json layering", () => {
     expect(initCmd).toContain('printf \'%s\' "$MCP_CONFIG" > /tmp/prompt/mcp.json');
   });
 });
+
+describe("paperclipTaskMarkdown surfacing", () => {
+  // Server-side heartbeat composes context.paperclipTaskMarkdown for wakes
+  // that carry first-class task context (notably PR-review wakes via the
+  // github webhook handler, which set contextSnapshot.githubPrNumber +
+  // githubRepoFullName but never produce a paperclipWake because there's
+  // no issue tied to the PR). Without this prompt slot, the PR review
+  // agent reaches the pod with NO information about which PR to review.
+  //
+  // See:
+  //   - server/services/heartbeat.ts buildPaperclipTaskMarkdown
+  //   - server/routes/github-webhook.ts (the wake call that sets
+  //     contextSnapshot.githubPrNumber + reviewKind)
+  it("includes context.paperclipTaskMarkdown in the assembled prompt", () => {
+    const taskMd = [
+      "Paperclip task context:",
+      "- PR: \"Blockcast/paperclip#59\"",
+      "- Wake reason: \"github_pr_opened\"",
+      "",
+      "GitHub PR review directive:",
+      "A GitHub webhook woke you to review this pull request.",
+    ].join("\n");
+    const ctx = makeCtx({ context: { paperclipTaskMarkdown: taskMd } });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(result.prompt).toContain("Blockcast/paperclip#59");
+    expect(result.prompt).toContain("github_pr_opened");
+    expect(result.prompt).toContain("GitHub PR review directive");
+    expect(result.promptMetrics.taskMarkdownChars).toBe(taskMd.length);
+  });
+
+  it("does NOT inject anything when paperclipTaskMarkdown is absent (no spurious newlines)", () => {
+    const result = buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() });
+    expect(result.promptMetrics.taskMarkdownChars).toBe(0);
+  });
+
+  it("trims surrounding whitespace from paperclipTaskMarkdown before inclusion", () => {
+    const taskMd = "\n\n  GitHub PR review directive:\n  ...\n\n";
+    const ctx = makeCtx({ context: { paperclipTaskMarkdown: taskMd } });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(result.promptMetrics.taskMarkdownChars).toBe(taskMd.trim().length);
+    expect(result.prompt).toContain("GitHub PR review directive");
+  });
+
+  // The whole point of inserting `taskMarkdown` at a *specific* position
+  // is so the agent reads task context (what to work on) after wake
+  // context (why it woke) but before the session handoff narrative
+  // (which may reference the task). A position-blind .toContain check
+  // would silently accept a reorder; this test pins the contract.
+  it("places taskMarkdown after wakePrompt and before sessionHandoffNote", () => {
+    // claude-k8s has a local minimal renderPaperclipWakePrompt that only
+    // emits "Wake reason: <reason>" lines (no issue identifier), so the
+    // wake sentinel must live in the `reason` field rather than
+    // `issue.identifier`.
+    const ctx = makeCtx({
+      context: {
+        paperclipWake: {
+          reason: "WAKE_SENTINEL_REASON",
+          issue: { id: "x", identifier: "BLO-X", title: "t" },
+        },
+        paperclipTaskMarkdown: "TASK-SENTINEL paperclipTaskMarkdown body",
+        paperclipSessionHandoffMarkdown: "HANDOFF-SENTINEL paperclipSessionHandoffMarkdown body",
+      },
+    });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const wakeIdx = result.prompt.indexOf("WAKE_SENTINEL_REASON");
+    const taskIdx = result.prompt.indexOf("TASK-SENTINEL");
+    const handoffIdx = result.prompt.indexOf("HANDOFF-SENTINEL");
+    expect(wakeIdx).toBeGreaterThan(-1);
+    expect(taskIdx).toBeGreaterThan(wakeIdx);
+    expect(handoffIdx).toBeGreaterThan(taskIdx);
+  });
+
+  // PR-review wakes overwhelmingly arrive WITH a resumed session: the
+  // reviewer agent keeps a long-running claude session across wakes. The
+  // resume-delta gate `Boolean(runtimeSessionId) && wakePrompt.length > 0`
+  // evaluates to `false` for that shape (paperclipWake is null when
+  // there's no issue tied to the PR), so `renderedPrompt` is NOT
+  // suppressed — the agent gets the full bootstrap + the PR directive.
+  // This test pins that behavior so a future refactor (e.g. gating
+  // resume-delta on `taskMarkdown.length > 0`) doesn't silently land.
+  it("does not gate resume-delta on taskMarkdown (PR-review wake shape: resumed session + no paperclipWake)", () => {
+    const ctx = makeCtx({
+      runtime: {
+        sessionId: "ses_pr_review",
+        sessionParams: { sessionId: "ses_pr_review" },
+        sessionDisplayId: "ses_pr_review",
+        taskKey: null,
+      },
+      context: {
+        paperclipTaskMarkdown: "GitHub PR review directive: review PR #59",
+      },
+    });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(result.prompt).toContain("GitHub PR review directive");
+    expect(result.promptMetrics.taskMarkdownChars).toBeGreaterThan(0);
+    // wakePrompt is empty (no paperclipWake) → resume-delta gate is OFF
+    // → heartbeat prompt template still renders.
+    expect(result.promptMetrics.wakePromptChars).toBe(0);
+    expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+  });
+
+  // The complementary shape: issue-wake with both paperclipWake AND
+  // paperclipTaskMarkdown set, on a resumed session. Resume-delta DOES
+  // engage (wakePrompt > 0), so `renderedPrompt` IS suppressed — but
+  // taskMarkdown must survive the suppression.
+  it("preserves taskMarkdown even when resume-delta suppresses the heartbeat prompt", () => {
+    const ctx = makeCtx({
+      runtime: {
+        sessionId: "ses_issue_wake",
+        sessionParams: { sessionId: "ses_issue_wake" },
+        sessionDisplayId: "ses_issue_wake",
+        taskKey: null,
+      },
+      context: {
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "iw", identifier: "BLO-1234", title: "t" },
+        },
+        paperclipTaskMarkdown: "Paperclip task context:\n- Issue: BLO-1234",
+      },
+    });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(result.prompt).toContain("Paperclip task context");
+    expect(result.promptMetrics.taskMarkdownChars).toBeGreaterThan(0);
+    expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
+    expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+});
