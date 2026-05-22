@@ -154,13 +154,13 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "text",
       key: "dockerCpuLimit",
       label: "DinD CPU Limit",
-      hint: "CPU limit for the DinD sidecar (default '2'). e.g. '2', '4000m'.",
+      hint: "CPU limit for the DinD sidecar (default '4'). e.g. '4', '4000m'.",
     },
     {
       type: "text",
       key: "dockerMemoryLimit",
       label: "DinD Memory Limit",
-      hint: "Memory limit for the DinD sidecar (default '2Gi'). e.g. '2Gi', '4Gi'.",
+      hint: "Memory limit for the DinD sidecar (default '8Gi'). e.g. '4Gi', '8Gi'.",
     },
   ];
 

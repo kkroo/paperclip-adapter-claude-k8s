@@ -364,8 +364,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const image = asString(config.image, "") || selfPod.image;
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
-  const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
-  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
+  const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
+  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
