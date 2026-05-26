@@ -522,8 +522,20 @@ describe("execute: stdout accumulator regression", () => {
 describe("execute: concurrency guard", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "prior-run", status: "running", startedAt: new Date().toISOString() }),
+    }));
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
   });
 
   it("returns k8s_concurrency_guard_unreachable when listNamespacedJob throws", async () => {
@@ -538,16 +550,92 @@ describe("execute: concurrency guard", () => {
     mockBatchListJobs.mockResolvedValue({ items: [orphan] });
     const result = await execute(makeCtx({ config: { reattachOrphanedJobs: false } } as Partial<AdapterExecutionContext>));
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
-    expect(result.errorMessage).toContain("reattach disabled");
+    expect(result.errorMessage).toContain("active run");
   });
 
-  it("returns k8s_orphan_task_unknown when orphan has no task label", async () => {
-    // No taskId on the orphan job and no taskId in context → block_task_unknown
+  it("deletes stale orphan and proceeds when the run-id lookup is terminal", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const orphan = makeJob({ runId: "prior-run", agentId: "agent-abc", taskId: "task-current" });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "prior-run", status: "failed", finishedAt: "2026-05-25T00:00:00.000Z" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({ context: { taskId: "task-current" }, authToken: "token-1" } as Partial<AdapterExecutionContext>));
+
+    expect(fetchMock).toHaveBeenCalledWith("https://paperclip.test/api/heartbeat-runs/prior-run", {
+      headers: { Authorization: "Bearer token-1" },
+    });
+    expect(mockBatchDeleteJob).toHaveBeenCalledWith({
+      name: "ac-job",
+      namespace: "paperclip",
+      body: { propagationPolicy: "Background" },
+    });
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("create reached");
+  });
+
+  it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const orphan = makeJob({ runId: "missing-run", agentId: "agent-abc", taskId: "task-current" });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+
+    const result = await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
+
+    expect(mockBatchDeleteJob).toHaveBeenCalledWith({
+      name: "ac-job",
+      namespace: "paperclip",
+      body: { propagationPolicy: "Background" },
+    });
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+  });
+
+  it("blocks when the run-id lookup is still active", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const orphan = makeJob({ runId: "active-run", agentId: "agent-abc", taskId: "task-current" });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+    }));
+
+    const result = await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
+
+    expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorMessage).toContain("active run");
+  });
+
+  it("still blocks unlabeled jobs as unknown orphans without consulting the run table", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const orphan = makeJob({ agentId: "agent-abc", taskId: "task-current" });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode).toBe("k8s_orphan_task_unknown");
+  });
+
+  it("returns k8s_concurrent_run_blocked when active run orphan has no task label", async () => {
     const orphan = makeJob({ runId: "prior-run", agentId: "agent-abc" }); // no taskId label
     mockBatchListJobs.mockResolvedValue({ items: [orphan] });
-    // context.taskId absent → currentTaskLabel = null → block_task_unknown
     const result = await execute(makeCtx());
-    expect(result.errorCode).toBe("k8s_orphan_task_unknown");
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorMessage).toContain("active run");
   });
 
   it("returns k8s_concurrent_run_blocked when orphan task-id mismatches current task", async () => {
@@ -557,10 +645,10 @@ describe("execute: concurrency guard", () => {
       makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>),
     );
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
-    expect(result.errorMessage).toContain("different task");
+    expect(result.errorMessage).toContain("active run");
   });
 
-  it("returns k8s_orphan_session_mismatch when task matches but session differs", async () => {
+  it("returns k8s_concurrent_run_blocked when active run task matches but session differs", async () => {
     const orphan = makeJob({
       runId: "prior-run",
       agentId: "agent-abc",
@@ -574,8 +662,8 @@ describe("execute: concurrency guard", () => {
         runtime: { sessionId: "sess-current", sessionParams: null, sessionDisplayId: null, taskKey: null },
       } as Partial<AdapterExecutionContext>),
     );
-    expect(result.errorCode).toBe("k8s_orphan_session_mismatch");
-    expect(result.errorMessage).toContain("mismatched session");
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorMessage).toContain("active run");
   });
 
   it("returns k8s_concurrent_run_blocked when same-run job is still running", async () => {
@@ -609,8 +697,7 @@ describe("execute: concurrency guard", () => {
     expect(result.errorCode).toBe("k8s_job_create_failed");
   });
 
-  it("reattaches to a matching orphan and returns k8s_pod_reattach_failed when pod is missing", async () => {
-    // Orphan with matching taskId and sessionId → reattach classification → reattachTarget is set
+  it("blocks a matching active-run orphan instead of reattaching", async () => {
     const orphan = makeJob({
       runId: "prior-run",
       agentId: "agent-abc",
@@ -618,11 +705,6 @@ describe("execute: concurrency guard", () => {
       sessionId: "sess-match",
     });
     mockBatchListJobs.mockResolvedValue({ items: [orphan] });
-    mockBatchPatchJob.mockResolvedValue({});
-    mockPrepareBundle.mockResolvedValue(makeBundle());
-    // Pod lookup finds nothing → reattach pod-not-found error
-    mockCoreListPods.mockResolvedValue({ items: [] });
-
     const result = await execute(
       makeCtx({
         context: { taskId: "task-match" },
@@ -630,8 +712,9 @@ describe("execute: concurrency guard", () => {
       } as Partial<AdapterExecutionContext>),
     );
 
-    expect(result.errorCode).toBe("k8s_pod_reattach_failed");
-    expect(result.errorMessage).toContain("no pod");
+    expect(mockBatchPatchJob).not.toHaveBeenCalled();
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorMessage).toContain("active run");
   });
 });
 
@@ -787,13 +870,22 @@ describe("execute: waitForPod edge cases", () => {
 describe("execute: concurrency guard — multiple orphans", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "prior-run", status: "running", startedAt: new Date().toISOString() }),
+    }));
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
   });
 
-  it("sorts multiple orphans newest-first and processes them in that order", async () => {
-    // orphanNew has a newer timestamp and a mismatching task → block_task_mismatch
-    // orphanOld has an older timestamp and a matching task → would reattach
-    // The sort (lines 603-605) must put orphanNew first so it is the one classified.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  it("blocks when any run-table-active orphan remains after stale jobs are filtered", async () => {
     const orphanOld = makeJob({ runId: "prior-1", agentId: "agent-abc", taskId: "task-match" });
     orphanOld.metadata!.creationTimestamp = new Date("2024-01-01T00:00:00Z") as unknown as Date;
     const orphanNew = makeJob({ runId: "prior-2", agentId: "agent-abc", taskId: "task-other" });
@@ -804,9 +896,8 @@ describe("execute: concurrency guard — multiple orphans", () => {
       makeCtx({ context: { taskId: "task-match" } } as Partial<AdapterExecutionContext>),
     );
 
-    // Newest orphan (task-other) is classified first → block_task_mismatch
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
-    expect(result.errorMessage).toContain("different task");
+    expect(result.errorMessage).toContain("active run");
   });
 });
 
