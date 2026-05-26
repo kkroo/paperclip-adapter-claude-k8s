@@ -22,6 +22,47 @@ import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+const RUN_ID_LABEL = "paperclip.io/run-id";
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timeout", "timed_out"]);
+
+type HeartbeatRunSnapshot = {
+  id: string;
+  status?: string | null;
+  completedAt?: string | null;
+  finishedAt?: string | null;
+};
+
+function readHeartbeatRunSnapshot(raw: unknown): HeartbeatRunSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const id = asString(obj.id, "").trim();
+  if (!id) return null;
+  return {
+    id,
+    status: asString(obj.status, "") || null,
+    completedAt: asString(obj.completedAt, "") || null,
+    finishedAt: asString(obj.finishedAt, "") || null,
+  };
+}
+
+function isActiveHeartbeatRun(run: HeartbeatRunSnapshot): boolean {
+  const status = (run.status ?? "").toLowerCase();
+  if (TERMINAL_RUN_STATUSES.has(status)) return false;
+  if (run.completedAt || run.finishedAt) return false;
+  return status === "running";
+}
+
+async function fetchHeartbeatRunSnapshot(ctx: AdapterExecutionContext, runId: string): Promise<HeartbeatRunSnapshot | null> {
+  const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
+  if (!apiUrl) throw new Error("PAPERCLIP_API_URL is required for k8s run-table concurrency checks");
+
+  const resp = await fetch(`${apiUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}`, {
+    headers: { Authorization: `Bearer ${ctx.authToken ?? ""}` },
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`run lookup failed for ${runId}: HTTP ${resp.status}`);
+  return readHeartbeatRunSnapshot(await resp.json());
+}
 
 // Module-level tracking of active Jobs for SIGTERM best-effort cleanup.
 interface ActiveJobRef {
@@ -170,10 +211,17 @@ async function tailPodLogFile(
   return accumulator.join("\n");
 }
 
-// Single source of truth lives in @paperclipai/adapter-utils. Re-exported
-// so existing test imports (`from "./execute.js"`) keep working.
-import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
-export { mergeEnvironmentConfig };
+export function mergeEnvironmentConfig(
+  adapterConfig: Record<string, unknown>,
+  envConfig: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const merged = { ...adapterConfig };
+  if (!envConfig) return merged;
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (value !== null && value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
 
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
@@ -795,7 +843,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // Hoist declarations used in both the guard+create phase and the log-streaming
   // section so the mutex try/finally can be added without a large re-indent.
-  let reattachTarget: { jobName: string; namespace: string; priorRunId: string; image: string } | null = null;
   // eslint-disable-next-line prefer-const
   let jobName!: string;
   // eslint-disable-next-line prefer-const
@@ -813,10 +860,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
-  const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, true);
-  const currentSessionLabel = currentSessionIdRaw ? sanitizeLabelValue(currentSessionIdRaw) : null;
-  const currentTaskIdRaw = asString(ctx.context.taskId, "") || asString(ctx.context.issueId, "");
-  const currentTaskLabel = currentTaskIdRaw ? sanitizeLabelValue(currentTaskIdRaw) : null;
   try {
     const existing = await batchApi.listNamespacedJob({
       namespace: guardNamespace,
@@ -828,83 +871,57 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
     );
     if (running.length > 0) {
-      // Separate orphaned jobs (from a previous server-side run) from truly
-      // concurrent jobs (same runId — shouldn't happen but guard defensively).
-      const orphaned = running.filter(
-        (j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") !== runId,
-      );
-      const samRun = running.filter(
-        (j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") === runId,
-      );
+      const activeRunning: typeof running = [];
+      for (const job of running) {
+        const jobRunId = job.metadata?.labels?.[RUN_ID_LABEL] ?? "";
+        const jobName = job.metadata?.name ?? "unknown";
+        const jobNamespace = job.metadata?.namespace ?? guardNamespace;
 
-      if (orphaned.length > 0) {
-        if (!reattachOrphanedJobs) {
-          // When reattach is disabled, block on any non-terminal orphan.
-          const names = orphaned.map((j) => j.metadata?.name).join(", ");
-          await onLog("stderr", `[paperclip] Concurrent run blocked: orphaned Job(s) running and reattach disabled: ${names}\n`);
+        if (!jobRunId) {
+          await onLog("stderr", `[paperclip] Blocked: running Job ${jobName} has no ${RUN_ID_LABEL} provenance label\n`);
           return {
             exitCode: null,
             signal: null,
             timedOut: false,
-            errorMessage: `Concurrent run blocked: orphaned Job(s) still running for this agent (reattach disabled)`,
-            errorCode: "k8s_concurrent_run_blocked",
+            errorMessage: `Concurrent run blocked: orphaned Job ${jobName} has unknown run provenance`,
+            errorCode: "k8s_orphan_task_unknown",
           };
         }
 
-        // Apply the decision matrix to each orphan, newest-first.  The first
-        // reattachable orphan becomes the target; any block classification
-        // stops the new run immediately.  Orphans are never deleted here —
-        // terminal ones are cleaned up by TTL; live mismatches should not be
-        // killed because they may still be doing real work.
-        const sortedOrphans = [...orphaned].sort((a, b) => {
-          const at = new Date(a.metadata?.creationTimestamp ?? 0).getTime();
-          const bt = new Date(b.metadata?.creationTimestamp ?? 0).getTime();
-          return bt - at;
-        });
-        for (const orphan of sortedOrphans) {
-          const classification = classifyOrphan(orphan, {
-            taskId: currentTaskLabel,
-            sessionId: currentSessionLabel,
-          });
-          const orphanName = orphan.metadata?.name ?? "unknown";
-          if (classification === "reattach") {
-            if (!reattachTarget) {
-              reattachTarget = {
-                jobName: orphanName,
-                namespace: orphan.metadata?.namespace ?? guardNamespace,
-                priorRunId: orphan.metadata?.labels?.["paperclip.io/run-id"] ?? "",
-                image: orphan.spec?.template?.spec?.containers?.[0]?.image ?? "unknown",
-              };
-            }
-          } else if (classification === "block_task_unknown") {
-            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} has missing task label — cannot safely reattach\n`);
-            return {
-              exitCode: null,
-              signal: null,
-              timedOut: false,
-              errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} has unknown task context`,
-              errorCode: "k8s_orphan_task_unknown",
-            };
-          } else if (classification === "block_task_mismatch") {
-            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} belongs to a different task\n`);
-            return {
-              exitCode: null,
-              signal: null,
-              timedOut: false,
-              errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} is running a different task`,
-              errorCode: "k8s_concurrent_run_blocked",
-            };
-          } else if (classification === "block_session_mismatch") {
-            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} has a different session\n`);
-            return {
-              exitCode: null,
-              signal: null,
-              timedOut: false,
-              errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} has a mismatched session`,
-              errorCode: "k8s_orphan_session_mismatch",
-            };
-          }
+        if (jobRunId === runId) {
+          activeRunning.push(job);
+          continue;
         }
+
+        const priorRun = await fetchHeartbeatRunSnapshot(ctx, jobRunId);
+        if (!priorRun || !isActiveHeartbeatRun(priorRun)) {
+          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath);
+          await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
+          continue;
+        }
+
+        activeRunning.push(job);
+      }
+
+      // Separate orphaned jobs (from a previous server-side run) from truly
+      // concurrent jobs (same runId — shouldn't happen but guard defensively).
+      const orphaned = activeRunning.filter(
+        (j) => (j.metadata?.labels?.[RUN_ID_LABEL] ?? "") !== runId,
+      );
+      const samRun = activeRunning.filter(
+        (j) => (j.metadata?.labels?.[RUN_ID_LABEL] ?? "") === runId,
+      );
+
+      if (orphaned.length > 0) {
+        const names = orphaned.map((j) => j.metadata?.name).join(", ");
+        await onLog("stderr", `[paperclip] Concurrent run blocked: active run-backed Job(s) still running for this agent: ${names}\n`);
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Concurrent run blocked: active run-backed Job ${names} is still running for this agent`,
+          errorCode: "k8s_concurrent_run_blocked",
+        };
       }
 
       // If there are still running Jobs that belong to THIS run (shouldn't happen
@@ -971,54 +988,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     onLog,
   });
 
-  if (reattachTarget) {
-    jobName = reattachTarget.jobName;
-    namespace = reattachTarget.namespace;
-    podLogPath = buildPodLogPath(ctx.agent.companyId, ctx.agent.id, runId);
-
-    // Announce reattach metadata.  Prompt and args aren't known here — they
-    // belong to the prior run that created this pod and are already present
-    // on the running container.
-    if (onMeta) {
-      await onMeta({
-        adapterType: "claude_k8s",
-        command: `kubectl job/${jobName}`,
-        cwd: namespace,
-        commandArgs: [],
-        commandNotes: [
-          `Image: ${reattachTarget.image}`,
-          `Namespace: ${namespace}`,
-          `Reattached from prior run: ${reattachTarget.priorRunId || "unknown"}`,
-          `Timeout: ${timeoutSec}s`,
-        ],
-        prompt: "",
-        context: ctx.context,
-      } as Parameters<typeof onMeta>[0]);
-    }
-
-    await onLog("stdout", `[paperclip] Reattaching to in-flight K8s Job ${jobName} in namespace ${namespace} (prior run ${reattachTarget.priorRunId || "unknown"})\n`);
-
-    // Relabel the reattached Job with the current run-id (and session-id if
-    // available) so the next concurrency guard sees it as owned by this run
-    // rather than an orphan from the prior run.
-    const labelPatch: Array<{ op: "add" | "replace"; path: string; value: string }> = [
-      { op: "replace", path: "/metadata/labels/paperclip.io~1run-id", value: runId },
-    ];
-    if (currentSessionLabel) {
-      labelPatch.push({ op: "replace", path: "/metadata/labels/paperclip.io~1session-id", value: currentSessionLabel });
-    }
-    try {
-      await batchApi.patchNamespacedJob({
-        name: jobName,
-        namespace,
-        body: labelPatch,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Warning: failed to relabel reattached Job ${jobName}: ${msg}\n`);
-    }
-  } else {
-    // Build Job manifest
+  // Build Job manifest
     const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });
     const job = built.job;
     jobName = built.jobName;
@@ -1138,7 +1108,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
-  }
   } finally {
     // Release the per-agent creation mutex so the next queued execute() call
     // can proceed with its guard+create phase (FAR-29).
@@ -1183,35 +1152,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const scheduleTimeoutMs = 120_000; // 2 minutes for scheduling
     let podName: string;
     try {
-      if (reattachTarget) {
-        // Pod is already running from the prior run — look it up directly.
-        const podList = await coreApi.listNamespacedPod({
-          namespace,
-          labelSelector: `job-name=${jobName}`,
-        });
-        const pod = podList.items[0];
-        const name = pod?.metadata?.name;
-        if (!name) {
-          throw new Error(`Reattach target Job ${jobName} has no pod`);
-        }
-        podName = name;
-        await onLog("stdout", `[paperclip] Reattached to pod ${podName}\n`);
-      } else {
-        podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
-        await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
-      }
+      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
+      await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
       podRunningAt = Date.now();
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const phase = reattachTarget ? "reattach" : "scheduling";
-      await onLog("stderr", `[paperclip] Pod ${phase} failed: ${msg}\n`);
+      await onLog("stderr", `[paperclip] Pod scheduling failed: ${msg}\n`);
       return {
         exitCode: null,
         signal: null,
         timedOut: false,
-        errorMessage: `Pod ${phase} failed: ${msg}`,
-        errorCode: reattachTarget ? "k8s_pod_reattach_failed" : "k8s_pod_schedule_failed",
+        errorMessage: `Pod scheduling failed: ${msg}`,
+        errorCode: "k8s_pod_schedule_failed",
       };
     }
 
@@ -1274,9 +1227,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
 
         // Cancel-polling: check if the Paperclip run was cancelled externally.
-        // Skipped on the reattach path to avoid tearing down an adopted Job.
         // HTTP non-2xx is treated as transient — never interpret a 5xx as cancel.
-        if (!reattachTarget && paperclipApiUrl && ctx.authToken) {
+        if (paperclipApiUrl && ctx.authToken) {
           try {
             const resp = await fetch(`${paperclipApiUrl}/api/heartbeat-runs/${runId}`, {
               headers: { Authorization: `Bearer ${ctx.authToken}` },
