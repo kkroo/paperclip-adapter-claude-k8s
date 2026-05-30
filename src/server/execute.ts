@@ -101,6 +101,86 @@ function ensureSigtermHandler(): void {
   });
 }
 
+async function listClaudeSessionJsonlFiles(root: string, sessionId: string): Promise<string[]> {
+  const files: string[] = [];
+  const stack = [root];
+  const target = `${sessionId}.jsonl`;
+
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && entry.name === target) {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  return files;
+}
+
+async function moveIfExists(source: string, dest: string): Promise<boolean> {
+  try {
+    await fs.stat(source);
+  } catch {
+    return false;
+  }
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  await fs.rename(source, dest);
+  return true;
+}
+
+function timestampForPath(date = new Date()): string {
+  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+async function quarantineClaudeSessionArtifacts(input: {
+  sessionId: string | null;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  const sessionId = input.sessionId?.trim() ?? "";
+  if (!/^[0-9a-fA-F-]{16,}$/.test(sessionId)) return;
+
+  const home = process.env.HOME || "/paperclip";
+  const projectsRoot = path.join(home, ".claude", "projects");
+  const quarantineRoot = path.join(home, ".claude", "quarantine", `immutable-thinking-${timestampForPath()}`);
+  const files = await listClaudeSessionJsonlFiles(projectsRoot, sessionId);
+  let moved = 0;
+
+  for (const file of files) {
+    const relative = path.relative(projectsRoot, file);
+    if (relative.startsWith("..")) continue;
+
+    if (await moveIfExists(file, path.join(quarantineRoot, "projects", relative))) {
+      moved++;
+    }
+
+    const sessionDir = path.join(path.dirname(file), sessionId);
+    const relativeSessionDir = path.relative(projectsRoot, sessionDir);
+    if (!relativeSessionDir.startsWith("..")) {
+      if (await moveIfExists(sessionDir, path.join(quarantineRoot, "projects", relativeSessionDir))) {
+        moved++;
+      }
+    }
+  }
+
+  if (moved > 0) {
+    await input.onLog(
+      "stdout",
+      `[paperclip] Quarantined ${moved} Claude session artifact(s) for immutable thinking failure: ${sessionId}\n`,
+    );
+  }
+}
+
 /**
  * Tail a pod log file from the shared PVC, emitting complete lines via onLog.
  * Uses adaptive polling: 250ms when the file is actively growing, backed off
@@ -1402,6 +1482,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     (exitCode ?? 0) !== 0 &&
     (isClaudeUnknownSessionError(parsed) || isClaudeImmutableThinkingBlockError(parsed))
   ) {
+    if (isClaudeImmutableThinkingBlockError(parsed)) {
+      const parsedSessionId = asString(parsed.session_id as string, "").trim();
+      await quarantineClaudeSessionArtifacts({
+        sessionId: parsedSessionId || currentSessionIdRaw || null,
+        onLog,
+      });
+    }
     await onLog("stdout", `[paperclip] Claude session is unavailable; clearing for next run.\n`);
     return {
       exitCode,

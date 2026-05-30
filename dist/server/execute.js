@@ -71,6 +71,73 @@ function ensureSigtermHandler() {
         process.kill(process.pid, "SIGTERM");
     });
 }
+async function listClaudeSessionJsonlFiles(root, sessionId) {
+    const files = [];
+    const stack = [root];
+    const target = `${sessionId}.jsonl`;
+    while (stack.length > 0) {
+        const dir = stack.pop();
+        let entries;
+        try {
+            entries = await fs.readdir(dir, { withFileTypes: true });
+        }
+        catch {
+            continue;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                stack.push(fullPath);
+            }
+            else if (entry.isFile() && entry.name === target) {
+                files.push(fullPath);
+            }
+        }
+    }
+    return files;
+}
+async function moveIfExists(source, dest) {
+    try {
+        await fs.stat(source);
+    }
+    catch {
+        return false;
+    }
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.rename(source, dest);
+    return true;
+}
+function timestampForPath(date = new Date()) {
+    return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+async function quarantineClaudeSessionArtifacts(input) {
+    const sessionId = input.sessionId?.trim() ?? "";
+    if (!/^[0-9a-fA-F-]{16,}$/.test(sessionId))
+        return;
+    const home = process.env.HOME || "/paperclip";
+    const projectsRoot = path.join(home, ".claude", "projects");
+    const quarantineRoot = path.join(home, ".claude", "quarantine", `immutable-thinking-${timestampForPath()}`);
+    const files = await listClaudeSessionJsonlFiles(projectsRoot, sessionId);
+    let moved = 0;
+    for (const file of files) {
+        const relative = path.relative(projectsRoot, file);
+        if (relative.startsWith(".."))
+            continue;
+        if (await moveIfExists(file, path.join(quarantineRoot, "projects", relative))) {
+            moved++;
+        }
+        const sessionDir = path.join(path.dirname(file), sessionId);
+        const relativeSessionDir = path.relative(projectsRoot, sessionDir);
+        if (!relativeSessionDir.startsWith("..")) {
+            if (await moveIfExists(sessionDir, path.join(quarantineRoot, "projects", relativeSessionDir))) {
+                moved++;
+            }
+        }
+    }
+    if (moved > 0) {
+        await input.onLog("stdout", `[paperclip] Quarantined ${moved} Claude session artifact(s) for immutable thinking failure: ${sessionId}\n`);
+    }
+}
 async function tailPodLogFile(filePath, opts) {
     const { onLog, stopSignal } = opts;
     const accumulator = [];
@@ -1238,6 +1305,13 @@ export async function execute(ctx) {
     if (parsed &&
         (exitCode ?? 0) !== 0 &&
         (isClaudeUnknownSessionError(parsed) || isClaudeImmutableThinkingBlockError(parsed))) {
+        if (isClaudeImmutableThinkingBlockError(parsed)) {
+            const parsedSessionId = asString(parsed.session_id, "").trim();
+            await quarantineClaudeSessionArtifacts({
+                sessionId: parsedSessionId || currentSessionIdRaw || null,
+                onLog,
+            });
+        }
         await onLog("stdout", `[paperclip] Claude session is unavailable; clearing for next run.\n`);
         return {
             exitCode,
