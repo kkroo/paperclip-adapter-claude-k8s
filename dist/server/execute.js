@@ -2,11 +2,48 @@ import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEn
 import fs from "node:fs/promises";
 import path from "node:path";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
-import { parseClaudeStreamJson, describeClaudeFailure, isClaudeMaxTurnsResult, isClaudeUnknownSessionError, } from "./parse.js";
+import { parseClaudeStreamJson, describeClaudeFailure, isClaudeMaxTurnsResult, isClaudeUnknownSessionError, isClaudeImmutableThinkingBlockError, } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
-import { buildJobManifest, buildPodLogPath, sanitizeLabelValue } from "./job-manifest.js";
+import { buildJobManifest, sanitizeLabelValue } from "./job-manifest.js";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+const RUN_ID_LABEL = "paperclip.io/run-id";
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timeout", "timed_out"]);
+function readHeartbeatRunSnapshot(raw) {
+    if (!raw || typeof raw !== "object")
+        return null;
+    const obj = raw;
+    const id = asString(obj.id, "").trim();
+    if (!id)
+        return null;
+    return {
+        id,
+        status: asString(obj.status, "") || null,
+        completedAt: asString(obj.completedAt, "") || null,
+        finishedAt: asString(obj.finishedAt, "") || null,
+    };
+}
+function isActiveHeartbeatRun(run) {
+    const status = (run.status ?? "").toLowerCase();
+    if (TERMINAL_RUN_STATUSES.has(status))
+        return false;
+    if (run.completedAt || run.finishedAt)
+        return false;
+    return status === "running";
+}
+async function fetchHeartbeatRunSnapshot(ctx, runId) {
+    const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
+    if (!apiUrl)
+        throw new Error("PAPERCLIP_API_URL is required for k8s run-table concurrency checks");
+    const resp = await fetch(`${apiUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}`, {
+        headers: { Authorization: `Bearer ${ctx.authToken ?? ""}` },
+    });
+    if (resp.status === 404)
+        return null;
+    if (!resp.ok)
+        throw new Error(`run lookup failed for ${runId}: HTTP ${resp.status}`);
+    return readHeartbeatRunSnapshot(await resp.json());
+}
 const activeJobs = new Set();
 // Per-agent serialization lock: prevents the TOCTOU race (FAR-29) where two
 // concurrent execute() calls for the same agent both pass the list-then-create
@@ -135,6 +172,16 @@ async function tailPodLogFile(filePath, opts) {
         await handle.close();
     }
     return accumulator.join("\n");
+}
+export function mergeEnvironmentConfig(adapterConfig, envConfig) {
+    const merged = { ...adapterConfig };
+    if (!envConfig)
+        return merged;
+    for (const [key, value] of Object.entries(envConfig)) {
+        if (value !== null && value !== undefined)
+            merged[key] = value;
+    }
+    return merged;
 }
 /**
  * Detect a Kubernetes 404 (Not Found) error from @kubernetes/client-node.
@@ -596,10 +643,39 @@ async function cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)
 }
 export async function execute(ctx) {
     const { runId, runtime, config: rawConfig, onLog, onMeta } = ctx;
-    const config = parseObject(rawConfig);
+    // Phase E.1 — when paperclip dispatches a heartbeat with a remote/k8s
+    // executionTarget, merge `executionTarget.config` (the env's K8sRemoteSpec)
+    // over the agent's adapter_config.  Environment fields win, but keys whose
+    // env value is null/undefined are skipped so a partially filled K8sRemoteSpec
+    // doesn't clobber adapter defaults.  Any other transport (ssh, sandbox) and
+    // local targets fall through to the agent's adapter_config unchanged.
+    // TODO(env-config): plumb cross-namespace secret resolution.  `secretsNamespace`
+    //  is merged through here so it lands in `effectiveConfig`, but downstream
+    //  Secret reads currently always use the Job's own namespace; a future patch
+    //  needs to pass `secretsNamespace` into the Secret-resolution path.
+    const target = ctx.executionTarget;
+    const isK8sRemoteTarget = target?.kind === "remote" && target?.transport === "k8s";
+    const adapterConfigObj = parseObject(rawConfig);
+    const effectiveConfig = isK8sRemoteTarget
+        ? mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)
+        : adapterConfigObj;
+    // Build a derived context whose `config` is the merged result so every
+    // downstream call (incl. buildJobManifest) sees the env-supplied fields.
+    const effectiveCtx = isK8sRemoteTarget
+        ? { ...ctx, config: effectiveConfig }
+        : ctx;
+    const config = effectiveConfig;
     const timeoutSec = asNumber(config.timeoutSec, 0);
     const graceSec = asNumber(config.graceSec, 60);
     const retainJobs = asBoolean(config.retainJobs, false);
+    // K8sRemoteSpec.kubeconfig is *content* (resolved by the env driver), but
+    // the adapter's existing config interprets `kubeconfig` as a filesystem
+    // path. When the env supplies null we fall through to in-cluster auth as
+    // today (mergeEnvironmentConfig skips null values, so adapter's
+    // "no kubeconfig" wins → undefined → loadFromCluster).
+    // TODO(env-config): when env supplies non-null kubeconfig content, write
+    //  it to a tmp file and load that path through getKubeConfig() so the
+    //  client uses the env-supplied credential. Out of scope for E.1.
     const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
     const paperclipApiUrl = process.env.PAPERCLIP_API_URL ?? "";
     if (!paperclipApiUrl) {
@@ -634,7 +710,6 @@ export async function execute(ctx) {
     await _prevCreation.catch(() => { });
     // Hoist declarations used in both the guard+create phase and the log-streaming
     // section so the mutex try/finally can be added without a large re-indent.
-    let reattachTarget = null;
     // eslint-disable-next-line prefer-const
     let jobName;
     // eslint-disable-next-line prefer-const
@@ -651,10 +726,6 @@ export async function execute(ctx) {
     try {
         const selfPod = await getSelfPodInfo(kubeconfigPath);
         const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
-        const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, true);
-        const currentSessionLabel = currentSessionIdRaw ? sanitizeLabelValue(currentSessionIdRaw) : null;
-        const currentTaskIdRaw = asString(ctx.context.taskId, "") || asString(ctx.context.issueId, "");
-        const currentTaskLabel = currentTaskIdRaw ? sanitizeLabelValue(currentTaskIdRaw) : null;
         try {
             const existing = await batchApi.listNamespacedJob({
                 namespace: guardNamespace,
@@ -663,80 +734,47 @@ export async function execute(ctx) {
             const running = existing.items.filter((j) => !j.metadata?.deletionTimestamp &&
                 !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"));
             if (running.length > 0) {
-                // Separate orphaned jobs (from a previous server-side run) from truly
-                // concurrent jobs (same runId — shouldn't happen but guard defensively).
-                const orphaned = running.filter((j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") !== runId);
-                const samRun = running.filter((j) => (j.metadata?.labels?.["paperclip.io/run-id"] ?? "") === runId);
-                if (orphaned.length > 0) {
-                    if (!reattachOrphanedJobs) {
-                        // When reattach is disabled, block on any non-terminal orphan.
-                        const names = orphaned.map((j) => j.metadata?.name).join(", ");
-                        await onLog("stderr", `[paperclip] Concurrent run blocked: orphaned Job(s) running and reattach disabled: ${names}\n`);
+                const activeRunning = [];
+                for (const job of running) {
+                    const jobRunId = job.metadata?.labels?.[RUN_ID_LABEL] ?? "";
+                    const jobName = job.metadata?.name ?? "unknown";
+                    const jobNamespace = job.metadata?.namespace ?? guardNamespace;
+                    if (!jobRunId) {
+                        await onLog("stderr", `[paperclip] Blocked: running Job ${jobName} has no ${RUN_ID_LABEL} provenance label\n`);
                         return {
                             exitCode: null,
                             signal: null,
                             timedOut: false,
-                            errorMessage: `Concurrent run blocked: orphaned Job(s) still running for this agent (reattach disabled)`,
-                            errorCode: "k8s_concurrent_run_blocked",
+                            errorMessage: `Concurrent run blocked: orphaned Job ${jobName} has unknown run provenance`,
+                            errorCode: "k8s_orphan_task_unknown",
                         };
                     }
-                    // Apply the decision matrix to each orphan, newest-first.  The first
-                    // reattachable orphan becomes the target; any block classification
-                    // stops the new run immediately.  Orphans are never deleted here —
-                    // terminal ones are cleaned up by TTL; live mismatches should not be
-                    // killed because they may still be doing real work.
-                    const sortedOrphans = [...orphaned].sort((a, b) => {
-                        const at = new Date(a.metadata?.creationTimestamp ?? 0).getTime();
-                        const bt = new Date(b.metadata?.creationTimestamp ?? 0).getTime();
-                        return bt - at;
-                    });
-                    for (const orphan of sortedOrphans) {
-                        const classification = classifyOrphan(orphan, {
-                            taskId: currentTaskLabel,
-                            sessionId: currentSessionLabel,
-                        });
-                        const orphanName = orphan.metadata?.name ?? "unknown";
-                        if (classification === "reattach") {
-                            if (!reattachTarget) {
-                                reattachTarget = {
-                                    jobName: orphanName,
-                                    namespace: orphan.metadata?.namespace ?? guardNamespace,
-                                    priorRunId: orphan.metadata?.labels?.["paperclip.io/run-id"] ?? "",
-                                    image: orphan.spec?.template?.spec?.containers?.[0]?.image ?? "unknown",
-                                };
-                            }
-                        }
-                        else if (classification === "block_task_unknown") {
-                            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} has missing task label — cannot safely reattach\n`);
-                            return {
-                                exitCode: null,
-                                signal: null,
-                                timedOut: false,
-                                errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} has unknown task context`,
-                                errorCode: "k8s_orphan_task_unknown",
-                            };
-                        }
-                        else if (classification === "block_task_mismatch") {
-                            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} belongs to a different task\n`);
-                            return {
-                                exitCode: null,
-                                signal: null,
-                                timedOut: false,
-                                errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} is running a different task`,
-                                errorCode: "k8s_concurrent_run_blocked",
-                            };
-                        }
-                        else if (classification === "block_session_mismatch") {
-                            await onLog("stderr", `[paperclip] Blocked: orphaned Job ${orphanName} has a different session\n`);
-                            return {
-                                exitCode: null,
-                                signal: null,
-                                timedOut: false,
-                                errorMessage: `Concurrent run blocked: orphaned Job ${orphanName} has a mismatched session`,
-                                errorCode: "k8s_orphan_session_mismatch",
-                            };
-                        }
+                    if (jobRunId === runId) {
+                        activeRunning.push(job);
+                        continue;
                     }
+                    const priorRun = await fetchHeartbeatRunSnapshot(ctx, jobRunId);
+                    if (!priorRun || !isActiveHeartbeatRun(priorRun)) {
+                        await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath);
+                        await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
+                        continue;
+                    }
+                    activeRunning.push(job);
+                }
+                // Separate orphaned jobs (from a previous server-side run) from truly
+                // concurrent jobs (same runId — shouldn't happen but guard defensively).
+                const orphaned = activeRunning.filter((j) => (j.metadata?.labels?.[RUN_ID_LABEL] ?? "") !== runId);
+                const samRun = activeRunning.filter((j) => (j.metadata?.labels?.[RUN_ID_LABEL] ?? "") === runId);
+                if (orphaned.length > 0) {
+                    const names = orphaned.map((j) => j.metadata?.name).join(", ");
+                    await onLog("stderr", `[paperclip] Concurrent run blocked: active run-backed Job(s) still running for this agent: ${names}\n`);
+                    return {
+                        exitCode: null,
+                        signal: null,
+                        timedOut: false,
+                        errorMessage: `Concurrent run blocked: active run-backed Job ${names} is still running for this agent`,
+                        errorCode: "k8s_concurrent_run_blocked",
+                    };
                 }
                 // If there are still running Jobs that belong to THIS run (shouldn't happen
                 // since we haven't created the Job yet), block execution.
@@ -798,172 +836,125 @@ export async function execute(ctx) {
             instructionsContents,
             onLog,
         });
-        if (reattachTarget) {
-            jobName = reattachTarget.jobName;
-            namespace = reattachTarget.namespace;
-            podLogPath = buildPodLogPath(ctx.agent.companyId, ctx.agent.id, runId);
-            // Announce reattach metadata.  Prompt and args aren't known here — they
-            // belong to the prior run that created this pod and are already present
-            // on the running container.
-            if (onMeta) {
-                await onMeta({
-                    adapterType: "claude_k8s",
-                    command: `kubectl job/${jobName}`,
-                    cwd: namespace,
-                    commandArgs: [],
-                    commandNotes: [
-                        `Image: ${reattachTarget.image}`,
-                        `Namespace: ${namespace}`,
-                        `Reattached from prior run: ${reattachTarget.priorRunId || "unknown"}`,
-                        `Timeout: ${timeoutSec}s`,
-                    ],
-                    prompt: "",
-                    context: ctx.context,
-                });
-            }
-            await onLog("stdout", `[paperclip] Reattaching to in-flight K8s Job ${jobName} in namespace ${namespace} (prior run ${reattachTarget.priorRunId || "unknown"})\n`);
-            // Relabel the reattached Job with the current run-id (and session-id if
-            // available) so the next concurrency guard sees it as owned by this run
-            // rather than an orphan from the prior run.
-            const labelPatch = [
-                { op: "replace", path: "/metadata/labels/paperclip.io~1run-id", value: runId },
-            ];
-            if (currentSessionLabel) {
-                labelPatch.push({ op: "replace", path: "/metadata/labels/paperclip.io~1session-id", value: currentSessionLabel });
-            }
-            try {
-                await batchApi.patchNamespacedJob({
-                    name: jobName,
-                    namespace,
-                    body: labelPatch,
-                });
-            }
-            catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                await onLog("stderr", `[paperclip] Warning: failed to relabel reattached Job ${jobName}: ${msg}\n`);
-            }
+        // Build Job manifest
+        const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });
+        const job = built.job;
+        jobName = built.jobName;
+        namespace = built.namespace;
+        const prompt = built.prompt;
+        const claudeArgs = built.claudeArgs;
+        const promptMetrics = built.promptMetrics;
+        promptSecret = built.promptSecret;
+        podLogPath = built.podLogPath;
+        if (built.skippedLabels.length > 0) {
+            await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
         }
-        else {
-            // Build Job manifest
-            const built = buildJobManifest({ ctx, selfPod, promptBundle });
-            const job = built.job;
-            jobName = built.jobName;
-            namespace = built.namespace;
-            const prompt = built.prompt;
-            const claudeArgs = built.claudeArgs;
-            const promptMetrics = built.promptMetrics;
-            promptSecret = built.promptSecret;
-            podLogPath = built.podLogPath;
-            if (built.skippedLabels.length > 0) {
-                await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
-            }
-            // Report invocation metadata
-            if (onMeta) {
-                await onMeta({
-                    adapterType: "claude_k8s",
-                    command: `kubectl job/${jobName}`,
-                    cwd: namespace,
-                    commandArgs: claudeArgs,
-                    commandNotes: [
-                        `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
-                        `Namespace: ${namespace}`,
-                        `Timeout: ${timeoutSec}s`,
-                        `Skills (${desiredSkills.length}): ${skillSummary}`,
-                    ],
-                    prompt,
-                    ...(promptMetrics ? { promptMetrics } : {}),
-                    context: ctx.context,
-                });
-            }
-            // If the prompt is large, create a Secret to hold it (avoids the ~1 MiB
-            // PodSpec limit).  The Secret is cleaned up in the finally block.
-            if (promptSecret) {
-                try {
-                    await coreApi.createNamespacedSecret({
-                        namespace: promptSecret.namespace,
-                        body: {
-                            apiVersion: "v1",
-                            kind: "Secret",
-                            metadata: {
-                                name: promptSecret.name,
-                                namespace: promptSecret.namespace,
-                                labels: {
-                                    "app.kubernetes.io/managed-by": "paperclip",
-                                    "paperclip.io/adapter-type": "claude_k8s",
-                                    "paperclip.io/run-id": runId,
-                                },
-                            },
-                            stringData: promptSecret.data,
-                        },
-                    });
-                    await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
-                }
-                catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
-                    return {
-                        exitCode: null,
-                        signal: null,
-                        timedOut: false,
-                        errorMessage: `Failed to create prompt Secret: ${msg}`,
-                        errorCode: "k8s_prompt_secret_create_failed",
-                    };
-                }
-            }
-            // Create the Job
-            let createdJobUid;
+        // Report invocation metadata
+        if (onMeta) {
+            await onMeta({
+                adapterType: "claude_k8s",
+                command: `kubectl job/${jobName}`,
+                cwd: namespace,
+                commandArgs: claudeArgs,
+                commandNotes: [
+                    `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
+                    `Namespace: ${namespace}`,
+                    `Timeout: ${timeoutSec}s`,
+                    `Skills (${desiredSkills.length}): ${skillSummary}`,
+                ],
+                prompt,
+                ...(promptMetrics ? { promptMetrics } : {}),
+                context: ctx.context,
+            });
+        }
+        // If the prompt is large, create a Secret to hold it (avoids the ~1 MiB
+        // PodSpec limit).  The Secret is cleaned up in the finally block.
+        if (promptSecret) {
             try {
-                const created = await batchApi.createNamespacedJob({ namespace, body: job });
-                createdJobUid = created.metadata?.uid;
+                await coreApi.createNamespacedSecret({
+                    namespace: promptSecret.namespace,
+                    body: {
+                        apiVersion: "v1",
+                        kind: "Secret",
+                        metadata: {
+                            name: promptSecret.name,
+                            namespace: promptSecret.namespace,
+                            labels: {
+                                "app.kubernetes.io/managed-by": "paperclip",
+                                "paperclip.io/adapter-type": "claude_k8s",
+                                "paperclip.io/run-id": runId,
+                            },
+                        },
+                        stringData: promptSecret.data,
+                    },
+                });
+                await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
-                if (promptSecret) {
-                    try {
-                        await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
-                    }
-                    catch { /* best-effort */ }
-                }
+                await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
                 return {
                     exitCode: null,
                     signal: null,
                     timedOut: false,
-                    errorMessage: `Failed to create Kubernetes Job: ${msg}`,
-                    errorCode: "k8s_job_create_failed",
+                    errorMessage: `Failed to create prompt Secret: ${msg}`,
+                    errorCode: "k8s_prompt_secret_create_failed",
                 };
             }
-            // Attach ownerReference so K8s GC cleans up the Secret if the process
-            // crashes before the finally block runs.
-            if (promptSecret && createdJobUid) {
-                try {
-                    await coreApi.patchNamespacedSecret({
-                        name: promptSecret.name,
-                        namespace: promptSecret.namespace,
-                        body: [
-                            {
-                                op: "add",
-                                path: "/metadata/ownerReferences",
-                                value: [
-                                    {
-                                        apiVersion: "batch/v1",
-                                        kind: "Job",
-                                        name: jobName,
-                                        uid: createdJobUid,
-                                        blockOwnerDeletion: false,
-                                    },
-                                ],
-                            },
-                        ],
-                    });
-                }
-                catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
-                }
-            }
-            await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
         }
+        // Create the Job
+        let createdJobUid;
+        try {
+            const created = await batchApi.createNamespacedJob({ namespace, body: job });
+            createdJobUid = created.metadata?.uid;
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
+            if (promptSecret) {
+                try {
+                    await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+                }
+                catch { /* best-effort */ }
+            }
+            return {
+                exitCode: null,
+                signal: null,
+                timedOut: false,
+                errorMessage: `Failed to create Kubernetes Job: ${msg}`,
+                errorCode: "k8s_job_create_failed",
+            };
+        }
+        // Attach ownerReference so K8s GC cleans up the Secret if the process
+        // crashes before the finally block runs.
+        if (promptSecret && createdJobUid) {
+            try {
+                await coreApi.patchNamespacedSecret({
+                    name: promptSecret.name,
+                    namespace: promptSecret.namespace,
+                    body: [
+                        {
+                            op: "add",
+                            path: "/metadata/ownerReferences",
+                            value: [
+                                {
+                                    apiVersion: "batch/v1",
+                                    kind: "Job",
+                                    name: jobName,
+                                    uid: createdJobUid,
+                                    blockOwnerDeletion: false,
+                                },
+                            ],
+                        },
+                    ],
+                });
+            }
+            catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
+            }
+        }
+        await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
     }
     finally {
         // Release the per-agent creation mutex so the next queued execute() call
@@ -1006,36 +997,19 @@ export async function execute(ctx) {
         const scheduleTimeoutMs = 120_000; // 2 minutes for scheduling
         let podName;
         try {
-            if (reattachTarget) {
-                // Pod is already running from the prior run — look it up directly.
-                const podList = await coreApi.listNamespacedPod({
-                    namespace,
-                    labelSelector: `job-name=${jobName}`,
-                });
-                const pod = podList.items[0];
-                const name = pod?.metadata?.name;
-                if (!name) {
-                    throw new Error(`Reattach target Job ${jobName} has no pod`);
-                }
-                podName = name;
-                await onLog("stdout", `[paperclip] Reattached to pod ${podName}\n`);
-            }
-            else {
-                podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
-                await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
-            }
+            podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
+            await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
             podRunningAt = Date.now();
         }
         catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            const phase = reattachTarget ? "reattach" : "scheduling";
-            await onLog("stderr", `[paperclip] Pod ${phase} failed: ${msg}\n`);
+            await onLog("stderr", `[paperclip] Pod scheduling failed: ${msg}\n`);
             return {
                 exitCode: null,
                 signal: null,
                 timedOut: false,
-                errorMessage: `Pod ${phase} failed: ${msg}`,
-                errorCode: reattachTarget ? "k8s_pod_reattach_failed" : "k8s_pod_schedule_failed",
+                errorMessage: `Pod scheduling failed: ${msg}`,
+                errorCode: "k8s_pod_schedule_failed",
             };
         }
         // Stream logs and wait for completion concurrently.
@@ -1093,9 +1067,8 @@ export async function execute(ctx) {
                     return;
                 }
                 // Cancel-polling: check if the Paperclip run was cancelled externally.
-                // Skipped on the reattach path to avoid tearing down an adopted Job.
                 // HTTP non-2xx is treated as transient — never interpret a 5xx as cancel.
-                if (!reattachTarget && paperclipApiUrl && ctx.authToken) {
+                if (paperclipApiUrl && ctx.authToken) {
                     try {
                         const resp = await fetch(`${paperclipApiUrl}/api/heartbeat-runs/${runId}`, {
                             headers: { Authorization: `Bearer ${ctx.authToken}` },
@@ -1258,8 +1231,13 @@ export async function execute(ctx) {
             parsed = recovered;
         }
     }
-    // If the session was stale, clear it so the next heartbeat starts fresh
-    if (parsed && (exitCode ?? 0) !== 0 && isClaudeUnknownSessionError(parsed)) {
+    // If the session was stale, clear it so the next heartbeat starts fresh.
+    // Claude can reject resumed sessions when immutable thinking blocks in the
+    // saved transcript no longer match the latest assistant turn; that has the
+    // same recovery path as an unknown/missing session.
+    if (parsed &&
+        (exitCode ?? 0) !== 0 &&
+        (isClaudeUnknownSessionError(parsed) || isClaudeImmutableThinkingBlockError(parsed))) {
         await onLog("stdout", `[paperclip] Claude session is unavailable; clearing for next run.\n`);
         return {
             exitCode,

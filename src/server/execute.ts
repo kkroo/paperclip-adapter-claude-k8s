@@ -15,6 +15,7 @@ import {
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeImmutableThinkingBlockError,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
 import { buildJobManifest, buildPodLogPath, sanitizeLabelValue } from "./job-manifest.js";
@@ -1392,8 +1393,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
 
-  // If the session was stale, clear it so the next heartbeat starts fresh
-  if (parsed && (exitCode ?? 0) !== 0 && isClaudeUnknownSessionError(parsed)) {
+  // If the session was stale, clear it so the next heartbeat starts fresh.
+  // Claude can reject resumed sessions when immutable thinking blocks in the
+  // saved transcript no longer match the latest assistant turn; that has the
+  // same recovery path as an unknown/missing session.
+  if (
+    parsed &&
+    (exitCode ?? 0) !== 0 &&
+    (isClaudeUnknownSessionError(parsed) || isClaudeImmutableThinkingBlockError(parsed))
+  ) {
     await onLog("stdout", `[paperclip] Claude session is unavailable; clearing for next run.\n`);
     return {
       exitCode,

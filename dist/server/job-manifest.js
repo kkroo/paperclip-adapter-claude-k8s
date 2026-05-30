@@ -255,7 +255,13 @@ function buildDindSidecar(opts) {
         name: "dind",
         image: opts.image,
         imagePullPolicy: "IfNotPresent",
-        args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"],
+        // `--group=1000` makes dockerd create /var/run/docker.sock with group 1000
+        // (mode 0660 root:1000). The main agent container runs as uid 1000 with
+        // podSecurityContext.fsGroup=1000, so without this it can't connect to the
+        // socket (dockerd otherwise creates it root:root mode 0660). Pairs with
+        // the pod-level runAsGroup=1000 / fsGroup=1000 this adapter already sets.
+        // BLO-5492.
+        args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2", "--group=1000"],
         securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
         env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
         resources: {
@@ -287,8 +293,8 @@ export function buildJobManifest(input) {
     const image = asString(config.image, "") || selfPod.image;
     const enableDocker = asBoolean(config.enableDocker, false);
     const dockerImage = asString(config.dockerImage, "docker:28-dind");
-    const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
-    const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
+    const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
+    const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
     const model = asString(config.model, "");
     const effort = asString(config.effort, "");
     const maxTurns = asNumber(config.maxTurnsPerRun, 0);
@@ -333,12 +339,20 @@ export function buildJobManifest(input) {
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(runtimeSessionId) });
+    // Server's heartbeat composes `context.paperclipTaskMarkdown` for wakes
+    // that carry first-class task context (PR-review wakes, issue wakes,
+    // wake-comment wakes). renderPaperclipWakePrompt only covers the
+    // issue/comment path via paperclipWake, so without this slot a
+    // github_pr_* wake reaches the pod with NO PR number / repo in the
+    // prompt and the reviewer agent has nothing to act on.
+    const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
     const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
     const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const prompt = joinPromptSections([
         renderedBootstrapPrompt,
         wakePrompt,
+        taskMarkdown,
         sessionHandoffNote,
         renderedPrompt,
     ]);
@@ -346,6 +360,7 @@ export function buildJobManifest(input) {
         promptChars: prompt.length,
         bootstrapPromptChars: renderedBootstrapPrompt.length,
         wakePromptChars: wakePrompt.length,
+        taskMarkdownChars: taskMarkdown.length,
         sessionHandoffChars: sessionHandoffNote.length,
         heartbeatPromptChars: renderedPrompt.length,
     };
@@ -466,15 +481,26 @@ export function buildJobManifest(input) {
             mountPath: "/tmp/prompt",
         },
     ];
-    // Mount shared PVC for /paperclip (session state, workspaces, data)
-    if (selfPod.pvcClaimName) {
+    // Mount shared PVC for /paperclip (session state, workspaces, data).
+    //
+    // Phase E.1 — when paperclip's k8s execution target supplies
+    // `workspaceVolumeClaim` / `workspaceMountPath`, those win over the
+    // adapter defaults derived from selfPod.  When unset, retain the
+    // selfPod-derived PVC and the conventional /paperclip mount path.
+    // `effectiveConfig` (built in execute.ts) lands these env-supplied
+    // values into `config.workspaceVolumeClaim` / `config.workspaceMountPath`.
+    const envWorkspaceClaim = asString(config.workspaceVolumeClaim, "").trim();
+    const envWorkspaceMountPath = asString(config.workspaceMountPath, "").trim();
+    const dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || "";
+    const dataMountPath = envWorkspaceMountPath || "/paperclip";
+    if (dataClaimName) {
         volumes.push({
             name: "data",
-            persistentVolumeClaim: { claimName: selfPod.pvcClaimName },
+            persistentVolumeClaim: { claimName: dataClaimName },
         });
         volumeMounts.push({
             name: "data",
-            mountPath: "/paperclip",
+            mountPath: dataMountPath,
         });
     }
     // Mount secret volumes inherited from the Deployment pod
@@ -538,13 +564,41 @@ export function buildJobManifest(input) {
     // accounts are exhausted, we still try claude with whatever
     // credentials are on disk so the operator gets a meaningful
     // 401-from-claude instead of an opaque init failure.
-    const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude >/dev/null 2>&1) || true`;
+    // When the environment driver supplies a per-env Anthropic account pool
+    // (effectiveConfig.providers.anthropic.accounts, plumbed through
+    // mergeEnvironmentConfig from executionTarget.config), constrain ccrotate's
+    // rotation to just that pool via `--accounts a@b.net,c@d.net`. Absent or
+    // empty pool → the appended segment is the empty string and the command
+    // stays bit-for-bit identical to the global-rotation behavior.
+    const providersConfig = parseObject(config.providers);
+    const anthropicConfig = parseObject(providersConfig.anthropic);
+    const anthropicAccounts = Array.isArray(anthropicConfig.accounts)
+        ? anthropicConfig.accounts.filter((s) => typeof s === "string" && s.length > 0)
+        : [];
+    const accountsArg = anthropicAccounts.length > 0 ? ` --accounts ${anthropicAccounts.join(",")}` : "";
+    const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
+    // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
+    // `rate_limit_event` with `overageStatus:"rejected"` +
+    // `overageDisabledReason:"out_of_credits"` was not a terminal signal to
+    // claude — the CLI keeps the session open and the wrapper sat there
+    // indefinitely (one observed pod hung 20h on this exact event). Watch
+    // the stream for that combination and exit non-zero; SIGPIPE then
+    // unwinds the upstream claude process and pipefail surfaces the
+    // failure. The harness recovery path will retry on a fresh account
+    // when quotas reset, instead of letting a wedged pod consume a slot.
+    //
+    // awk runs after `tee`, so the rate_limit_event line is already
+    // persisted to the pod log before we exit. `fflush()` keeps the awk
+    // pipeline line-buffered (default `gawk`/`mawk` would buffer otherwise
+    // and stream-json events would batch to ~4 KiB before flushing).
+    const failFastFilter = `awk '{ print; fflush() } /\"overageStatus\":\"rejected\"/ && /\"overageDisabledReason\":\"out_of_credits\"/ { print \"[wrapper] terminal rate-limit: out_of_credits overage rejected; exiting non-zero so harness can retry on quota reset\" > \"/dev/stderr\"; exit 1 }'`;
     // `set -o pipefail` so a claude binary crash (OOM, segfault, missing-bin)
-    // surfaces as a non-zero shell exit code instead of being masked by tee's
-    // exit code. Without pipefail the pod marks Succeeded even when claude
-    // never emits any stream-json — paperclip-server's parser only catches
-    // type:error events from inside the JSON stream, not pre-stream crashes.
-    const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath}`;
+    // OR the fail-fast awk surfaces as a non-zero shell exit code instead
+    // of being masked by the trailing `cat`'s exit code. Without pipefail
+    // the pod marks Succeeded even when claude never emits any stream-json
+    // — paperclip-server's parser only catches type:error events from
+    // inside the JSON stream, not pre-stream crashes.
+    const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
     // When the DinD sidecar is wired in, prepend the wait-for-socket loop
     // so the agent never starts before dockerd is listening on the shared
     // unix socket. Mirrors the opencode_k8s adapter.
@@ -593,7 +647,7 @@ export function buildJobManifest(input) {
         initEnv.push({ name: "MCP_CONFIG", value: mergedMcpJson });
     }
     const initVolumeMounts = [
-        { name: "data", mountPath: "/paperclip" },
+        { name: "data", mountPath: dataMountPath },
         { name: "prompt", mountPath: "/tmp/prompt" },
     ];
     if (useLargePromptPath) {

@@ -221,3 +221,15 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
     /no conversation found with session id|unknown session|session .* not found/i.test(msg),
   );
 }
+
+export function isClaudeImmutableThinkingBlockError(parsed: Record<string, unknown>): boolean {
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  return allMessages.some((msg) =>
+    /thinking|redacted_thinking/i.test(msg) &&
+    /latest assistant message cannot be modified|blocks must remain as they were in the original response/i.test(msg),
+  );
+}

@@ -21,4 +21,5 @@ export declare function detectClaudeLoginRequired(input: {
 export declare function describeClaudeFailure(parsed: Record<string, unknown>): string | null;
 export declare function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean;
 export declare function isClaudeUnknownSessionError(parsed: Record<string, unknown>): boolean;
+export declare function isClaudeImmutableThinkingBlockError(parsed: Record<string, unknown>): boolean;
 //# sourceMappingURL=parse.d.ts.map

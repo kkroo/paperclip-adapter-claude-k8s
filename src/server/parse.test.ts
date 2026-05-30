@@ -6,6 +6,7 @@ import {
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeImmutableThinkingBlockError,
 } from "./parse.js";
 
 describe("parseClaudeStreamJson", () => {
@@ -442,5 +443,27 @@ describe("isClaudeUnknownSessionError", () => {
 
   it("checks error array messages", () => {
     expect(isClaudeUnknownSessionError({ errors: ["session abc not found"] })).toBe(true);
+  });
+});
+
+describe("isClaudeImmutableThinkingBlockError", () => {
+  it("detects immutable thinking block API errors in result text", () => {
+    expect(isClaudeImmutableThinkingBlockError({
+      result:
+        "API Error: 400 messages.65.content.172: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+    })).toBe(true);
+  });
+
+  it("detects immutable thinking block API errors in error array messages", () => {
+    expect(isClaudeImmutableThinkingBlockError({
+      errors: [{
+        message:
+          "messages.1.content.100: `redacted_thinking` blocks in the latest assistant message cannot be modified",
+      }],
+    })).toBe(true);
+  });
+
+  it("returns false for unrelated thinking text", () => {
+    expect(isClaudeImmutableThinkingBlockError({ result: "thinking about the next step" })).toBe(false);
   });
 });
