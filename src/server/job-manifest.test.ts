@@ -384,6 +384,14 @@ describe("buildJobManifest", () => {
       expect(promptVol?.emptyDir).toEqual({});
     });
 
+    it("mounts runtime cache emptyDir outside /paperclip", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const cacheVol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "runtime-cache");
+      expect(cacheVol?.emptyDir?.sizeLimit).toBe("20Gi");
+      const cacheMount = job.spec?.template?.spec?.containers[0]?.volumeMounts?.find((vm) => vm.name === "runtime-cache");
+      expect(cacheMount?.mountPath).toBe("/runtime-cache");
+    });
+
     it("mounts data PVC at /paperclip when pvcClaimName is set", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const dataVol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "data");
@@ -418,6 +426,34 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const home = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "HOME");
       expect(home?.value).toBe("/paperclip");
+    });
+
+    it("defaults build and package caches to runtime-cache emptyDir", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
+      expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+      expect(env.get("GOCACHE")).toBe("/runtime-cache/go-build");
+      expect(env.get("GOMODCACHE")).toBe("/runtime-cache/gomod");
+      expect(env.get("npm_config_cache")).toBe("/runtime-cache/npm");
+      expect(env.get("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
+      expect(env.get("PIP_CACHE_DIR")).toBe("/runtime-cache/pip");
+      expect(env.get("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
+    });
+
+    it("overrides inherited cache paths with the job-local runtime-cache mount", () => {
+      selfPod.inheritedEnv = { XDG_CACHE_HOME: "/paperclip/.cache", GOCACHE: "/paperclip/.cache/go-build" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
+      expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+      expect(env.get("GOCACHE")).toBe("/runtime-cache/go-build");
+    });
+
+    it("preserves explicit adapter cache env overrides", () => {
+      ctx.config = { env: { XDG_CACHE_HOME: "/custom-cache", GOCACHE: "/custom-go-cache" } };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
+      expect(env.get("XDG_CACHE_HOME")).toBe("/custom-cache");
+      expect(env.get("GOCACHE")).toBe("/custom-go-cache");
     });
 
     it("inherits env vars from selfPod", () => {
