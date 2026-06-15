@@ -55,6 +55,18 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
 /** Prompts above this size (bytes) are staged via a Secret instead of an
  *  init container env var, protecting against the ~1 MiB PodSpec limit. */
 const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
+const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
+const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+const RUNTIME_CACHE_ENV: Record<string, string> = {
+  XDG_CACHE_HOME: `${RUNTIME_CACHE_MOUNT_PATH}/xdg`,
+  GOCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/go-build`,
+  GOMODCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/gomod`,
+  npm_config_cache: `${RUNTIME_CACHE_MOUNT_PATH}/npm`,
+  BUN_INSTALL_CACHE: `${RUNTIME_CACHE_MOUNT_PATH}/bun`,
+  PIP_CACHE_DIR: `${RUNTIME_CACHE_MOUNT_PATH}/pip`,
+  PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
+};
 
 // Inline prompt assembly — these functions are not yet in the published adapter-utils
 function joinPromptSections(sections: string[], separator = "\n\n"): string {
@@ -273,12 +285,16 @@ function buildEnvVars(
   };
 
   // Layer 4: User-defined overrides from adapterConfig.env (wins over everything)
+  const userEnvKeys = new Set(Object.keys(envConfig));
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") merged[key] = value;
   }
 
   // HOME must be /paperclip to match PVC mount and enable session resume
   merged.HOME = "/paperclip";
+  for (const [key, value] of Object.entries(RUNTIME_CACHE_ENV)) {
+    if (!userEnvKeys.has(key)) merged[key] = value;
+  }
 
   // Convert literal env to V1EnvVar array
   const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
@@ -551,11 +567,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       name: "prompt",
       emptyDir: {},
     },
+    {
+      name: RUNTIME_CACHE_VOLUME_NAME,
+      emptyDir: { sizeLimit: RUNTIME_CACHE_SIZE_LIMIT },
+    },
   ];
   const volumeMounts: k8s.V1VolumeMount[] = [
     {
       name: "prompt",
       mountPath: "/tmp/prompt",
+    },
+    {
+      name: RUNTIME_CACHE_VOLUME_NAME,
+      mountPath: RUNTIME_CACHE_MOUNT_PATH,
     },
   ];
 
