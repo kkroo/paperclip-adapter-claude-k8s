@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { buildJobManifest, buildPodLogPath, sanitizeLabelValue } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
@@ -39,6 +42,11 @@ describe("buildJobManifest", () => {
   beforeEach(() => {
     ctx = makeCtx();
     selfPod = makeSelfPod();
+    delete process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH;
+  });
+
+  afterEach(() => {
+    delete process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH;
   });
 
   describe("job naming", () => {
@@ -1034,6 +1042,43 @@ describe("per-agent mcp.json layering", () => {
     const init = job.spec!.template.spec!.initContainers![0];
     const initEnvNames = (init.env ?? []).map((e) => e.name);
     expect(initEnvNames).not.toContain("MCP_CONFIG");
+  });
+
+  it("ships the shared baseline even when adapterConfig.mcpServers is empty", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-k8s-mcp-"));
+    const baselinePath = join(dir, ".mcp.json");
+    try {
+      writeFileSync(
+        baselinePath,
+        JSON.stringify({
+          mcpServers: {
+            paperclip: {
+              command: "node",
+              args: ["/app/packages/mcp-server/dist/stdio.js"],
+            },
+          },
+        }),
+      );
+      process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH = baselinePath;
+
+      const { claudeArgs, job } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).toContain("--mcp-config");
+      expect(claudeArgs).toContain("/tmp/prompt/mcp.json");
+      expect(claudeArgs).toContain("--strict-mcp-config");
+
+      const init = job.spec!.template.spec!.initContainers![0];
+      const mcpEnv = (init.env ?? []).find((e) => e.name === "MCP_CONFIG");
+      expect(mcpEnv).toBeDefined();
+      const parsed = JSON.parse(mcpEnv!.value!) as {
+        mcpServers: Record<string, { command?: string; args?: string[] }>;
+      };
+      expect(parsed.mcpServers.paperclip).toEqual({
+        command: "node",
+        args: ["/app/packages/mcp-server/dist/stdio.js"],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("merges per-agent overrides on top of the shared baseline and ships --mcp-config + --strict-mcp-config", () => {

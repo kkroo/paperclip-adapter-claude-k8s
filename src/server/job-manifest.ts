@@ -14,19 +14,22 @@ import { readFileSync } from "node:fs";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 
 /**
- * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
+ * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
  * writes on every pod start. The adapter runs inside the paperclip
  * StatefulSet pod, which mounts the same /paperclip PVC the Job pods will
  * mount, so reading this path here gives us the exact baseline the Job
- * pod would otherwise inherit. Read lazily (only when an agent actually
- * supplies adapterConfig.mcpServers) so the adapter does not require the
- * file to exist for normal operation — and so unit tests don't blow up.
+ * pod would otherwise inherit. Read lazily so the adapter does not require
+ * the file to exist for normal operation — and so unit tests don't blow up.
  */
-const SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
+const DEFAULT_SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
+
+function sharedMcpBaselinePath(): string {
+  return process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH || DEFAULT_SHARED_MCP_BASELINE_PATH;
+}
 
 function loadSharedMcpBaseline(): Record<string, unknown> {
   try {
-    const raw = readFileSync(SHARED_MCP_BASELINE_PATH, "utf8");
+    const raw = readFileSync(sharedMcpBaselinePath(), "utf8");
     const parsed = JSON.parse(raw) as { mcpServers?: unknown };
     if (parsed && typeof parsed === "object" && parsed.mcpServers && typeof parsed.mcpServers === "object") {
       return parsed.mcpServers as Record<string, unknown>;
@@ -468,7 +471,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Per-agent MCP layering — adapterConfig.mcpServers is a map of
   // server-name → MCP server spec ({command, args, env, ...} for stdio
   // or {type: "http"|"sse", url} for transport-typed entries).
-  // When set, we merge with the shared baseline at /paperclip/.mcp.json
+  // Always merge with the shared baseline at /paperclip/.mcp.json
   // (paperclip + prometheus + tempo + kubernetes-readonly + github,
   // written by the helm chart's seed-init) and ship the result with
   // claude --mcp-config + --strict-mcp-config so the agent gets exactly
@@ -477,12 +480,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // entries are added. To swap kubernetes-readonly for ns-rw or admin,
   // override the "kubernetes" key. To add figma, set a new "figma" key.
   const perAgentMcpServers = parseObject(config.mcpServers);
-  const hasPerAgentMcp = Object.keys(perAgentMcpServers).length > 0;
+  const baselineMcpServers = loadSharedMcpBaseline();
+  const mergedMcpServers = { ...baselineMcpServers, ...perAgentMcpServers };
   let mergedMcpJson: string | null = null;
-  if (hasPerAgentMcp) {
-    const baseline = loadSharedMcpBaseline();
-    const merged = { ...baseline, ...perAgentMcpServers };
-    mergedMcpJson = JSON.stringify({ mcpServers: merged });
+  if (Object.keys(mergedMcpServers).length > 0) {
+    mergedMcpJson = JSON.stringify({ mcpServers: mergedMcpServers });
   }
 
   // Build Claude CLI args

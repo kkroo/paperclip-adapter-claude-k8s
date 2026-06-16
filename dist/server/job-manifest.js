@@ -2,18 +2,20 @@ import { asString, asNumber, asBoolean, asStringArray, parseObject, buildPapercl
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 /**
- * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
+ * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
  * writes on every pod start. The adapter runs inside the paperclip
  * StatefulSet pod, which mounts the same /paperclip PVC the Job pods will
  * mount, so reading this path here gives us the exact baseline the Job
- * pod would otherwise inherit. Read lazily (only when an agent actually
- * supplies adapterConfig.mcpServers) so the adapter does not require the
- * file to exist for normal operation — and so unit tests don't blow up.
+ * pod would otherwise inherit. Read lazily so the adapter does not require
+ * the file to exist for normal operation — and so unit tests don't blow up.
  */
-const SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
+const DEFAULT_SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
+function sharedMcpBaselinePath() {
+    return process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH || DEFAULT_SHARED_MCP_BASELINE_PATH;
+}
 function loadSharedMcpBaseline() {
     try {
-        const raw = readFileSync(SHARED_MCP_BASELINE_PATH, "utf8");
+        const raw = readFileSync(sharedMcpBaselinePath(), "utf8");
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && parsed.mcpServers && typeof parsed.mcpServers === "object") {
             return parsed.mcpServers;
@@ -39,6 +41,18 @@ export function buildPodLogPath(companyId, agentId, runId) {
 /** Prompts above this size (bytes) are staged via a Secret instead of an
  *  init container env var, protecting against the ~1 MiB PodSpec limit. */
 const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
+const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
+const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+const RUNTIME_CACHE_ENV = {
+    XDG_CACHE_HOME: `${RUNTIME_CACHE_MOUNT_PATH}/xdg`,
+    GOCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/go-build`,
+    GOMODCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/gomod`,
+    npm_config_cache: `${RUNTIME_CACHE_MOUNT_PATH}/npm`,
+    BUN_INSTALL_CACHE: `${RUNTIME_CACHE_MOUNT_PATH}/bun`,
+    PIP_CACHE_DIR: `${RUNTIME_CACHE_MOUNT_PATH}/pip`,
+    PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
+};
 // Inline prompt assembly — these functions are not yet in the published adapter-utils
 function joinPromptSections(sections, separator = "\n\n") {
     return sections.filter((s) => s.trim().length > 0).join(separator);
@@ -213,12 +227,17 @@ function buildEnvVars(ctx, selfPod, config) {
         ...paperclipEnv,
     };
     // Layer 4: User-defined overrides from adapterConfig.env (wins over everything)
+    const userEnvKeys = new Set(Object.keys(envConfig));
     for (const [key, value] of Object.entries(envConfig)) {
         if (typeof value === "string")
             merged[key] = value;
     }
     // HOME must be /paperclip to match PVC mount and enable session resume
     merged.HOME = "/paperclip";
+    for (const [key, value] of Object.entries(RUNTIME_CACHE_ENV)) {
+        if (!userEnvKeys.has(key))
+            merged[key] = value;
+    }
     // Convert literal env to V1EnvVar array
     const envVars = Object.entries(merged).map(([name, value]) => ({
         name,
@@ -367,7 +386,7 @@ export function buildJobManifest(input) {
     // Per-agent MCP layering — adapterConfig.mcpServers is a map of
     // server-name → MCP server spec ({command, args, env, ...} for stdio
     // or {type: "http"|"sse", url} for transport-typed entries).
-    // When set, we merge with the shared baseline at /paperclip/.mcp.json
+    // Always merge with the shared baseline at /paperclip/.mcp.json
     // (paperclip + prometheus + tempo + kubernetes-readonly + github,
     // written by the helm chart's seed-init) and ship the result with
     // claude --mcp-config + --strict-mcp-config so the agent gets exactly
@@ -376,12 +395,11 @@ export function buildJobManifest(input) {
     // entries are added. To swap kubernetes-readonly for ns-rw or admin,
     // override the "kubernetes" key. To add figma, set a new "figma" key.
     const perAgentMcpServers = parseObject(config.mcpServers);
-    const hasPerAgentMcp = Object.keys(perAgentMcpServers).length > 0;
+    const baselineMcpServers = loadSharedMcpBaseline();
+    const mergedMcpServers = { ...baselineMcpServers, ...perAgentMcpServers };
     let mergedMcpJson = null;
-    if (hasPerAgentMcp) {
-        const baseline = loadSharedMcpBaseline();
-        const merged = { ...baseline, ...perAgentMcpServers };
-        mergedMcpJson = JSON.stringify({ mcpServers: merged });
+    if (Object.keys(mergedMcpServers).length > 0) {
+        mergedMcpJson = JSON.stringify({ mcpServers: mergedMcpServers });
     }
     // Build Claude CLI args
     // Prefer the bundle's materialized instructions file over the raw config path.
@@ -474,11 +492,19 @@ export function buildJobManifest(input) {
             name: "prompt",
             emptyDir: {},
         },
+        {
+            name: RUNTIME_CACHE_VOLUME_NAME,
+            emptyDir: { sizeLimit: RUNTIME_CACHE_SIZE_LIMIT },
+        },
     ];
     const volumeMounts = [
         {
             name: "prompt",
             mountPath: "/tmp/prompt",
+        },
+        {
+            name: RUNTIME_CACHE_VOLUME_NAME,
+            mountPath: RUNTIME_CACHE_MOUNT_PATH,
         },
     ];
     // Mount shared PVC for /paperclip (session state, workspaces, data).
