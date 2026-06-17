@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -35,18 +35,35 @@ function makeSelfPod(overrides: Partial<SelfPodInfo> = {}): SelfPodInfo {
   };
 }
 
+function encodeClaudeCwd(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9-]/g, "-");
+}
+
+function createClaudeConfigDirWithSession(sessionId: string, workingDir = "/paperclip"): string {
+  const configDir = mkdtempSync(join(tmpdir(), "claude-k8s-session-"));
+  const projectDir = join(configDir, "projects", encodeClaudeCwd(workingDir));
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, `${sessionId}.jsonl`), "{}\n");
+  return configDir;
+}
+
 describe("buildJobManifest", () => {
   let ctx: AdapterExecutionContext;
   let selfPod: SelfPodInfo;
+  let tempDirs: string[];
 
   beforeEach(() => {
     ctx = makeCtx();
     selfPod = makeSelfPod();
+    tempDirs = [];
     delete process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH;
   });
 
   afterEach(() => {
     delete process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH;
+    for (const dir of tempDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   describe("job naming", () => {
@@ -675,11 +692,29 @@ describe("buildJobManifest", () => {
       expect(claudeArgs).toContain("10");
     });
 
-    it("adds --resume when sessionId present", () => {
+    it("adds --resume when matching Claude session file exists", () => {
+      const configDir = createClaudeConfigDirWithSession("sess_abc");
+      tempDirs.push(configDir);
+      ctx.config = { env: { CLAUDE_CONFIG_DIR: configDir } };
       ctx.runtime.sessionId = "sess_abc";
       const { claudeArgs } = buildJobManifest({ ctx, selfPod });
       expect(claudeArgs).toContain("--resume");
       expect(claudeArgs).toContain("sess_abc");
+    });
+
+    it("starts a fresh Claude session when runtime sessionId has no local Claude session file", () => {
+      const configDir = mkdtempSync(join(tmpdir(), "claude-k8s-session-missing-"));
+      tempDirs.push(configDir);
+      ctx.config = {
+        instructionsFilePath: "/paperclip/instructions.md",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      };
+      ctx.runtime.sessionId = "a24fcff7-99a3-43ad-b0d0-1e145827369c";
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).not.toContain("--resume");
+      expect(claudeArgs).not.toContain("a24fcff7-99a3-43ad-b0d0-1e145827369c");
+      expect(claudeArgs).toContain("--append-system-prompt-file");
+      expect(claudeArgs).toContain("/paperclip/instructions.md");
     });
 
     it("adds --dangerously-skip-permissions by default", () => {
@@ -695,7 +730,12 @@ describe("buildJobManifest", () => {
     });
 
     it("omits --append-system-prompt-file on session resume (avoids token waste)", () => {
-      ctx.config = { instructionsFilePath: "/paperclip/instructions.md" };
+      const configDir = createClaudeConfigDirWithSession("sess_existing");
+      tempDirs.push(configDir);
+      ctx.config = {
+        instructionsFilePath: "/paperclip/instructions.md",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      };
       ctx.runtime.sessionId = "sess_existing";
       const { claudeArgs } = buildJobManifest({ ctx, selfPod });
       expect(claudeArgs).not.toContain("--append-system-prompt-file");
@@ -729,12 +769,15 @@ describe("buildJobManifest", () => {
     });
 
     it("omits --append-system-prompt-file from bundle on session resume", () => {
+      const configDir = createClaudeConfigDirWithSession("sess_existing");
+      tempDirs.push(configDir);
       const promptBundle = {
         bundleKey: "abc123",
         rootDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
         addDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
         instructionsFilePath: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123/agent-instructions.md",
       };
+      ctx.config = { env: { CLAUDE_CONFIG_DIR: configDir } };
       ctx.runtime.sessionId = "sess_existing";
       const { claudeArgs } = buildJobManifest({ ctx, selfPod, promptBundle });
       expect(claudeArgs).not.toContain("--append-system-prompt-file");
@@ -1147,6 +1190,18 @@ describe("per-agent mcp.json layering", () => {
 });
 
 describe("paperclipTaskMarkdown surfacing", () => {
+  let tempDirs: string[];
+
+  beforeEach(() => {
+    tempDirs = [];
+  });
+
+  afterEach(() => {
+    for (const dir of tempDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // Server-side heartbeat composes context.paperclipTaskMarkdown for wakes
   // that carry first-class task context (notably PR-review wakes via the
   // github webhook handler, which set contextSnapshot.githubPrNumber +
@@ -1226,7 +1281,10 @@ describe("paperclipTaskMarkdown surfacing", () => {
   // This test pins that behavior so a future refactor (e.g. gating
   // resume-delta on `taskMarkdown.length > 0`) doesn't silently land.
   it("does not gate resume-delta on taskMarkdown (PR-review wake shape: resumed session + no paperclipWake)", () => {
+    const configDir = createClaudeConfigDirWithSession("ses_pr_review");
+    tempDirs.push(configDir);
     const ctx = makeCtx({
+      config: { env: { CLAUDE_CONFIG_DIR: configDir } },
       runtime: {
         sessionId: "ses_pr_review",
         sessionParams: { sessionId: "ses_pr_review" },
@@ -1251,7 +1309,10 @@ describe("paperclipTaskMarkdown surfacing", () => {
   // engage (wakePrompt > 0), so `renderedPrompt` IS suppressed — but
   // taskMarkdown must survive the suppression.
   it("preserves taskMarkdown even when resume-delta suppresses the heartbeat prompt", () => {
+    const configDir = createClaudeConfigDirWithSession("ses_issue_wake");
+    tempDirs.push(configDir);
     const ctx = makeCtx({
+      config: { env: { CLAUDE_CONFIG_DIR: configDir } },
       runtime: {
         sessionId: "ses_issue_wake",
         sessionParams: { sessionId: "ses_issue_wake" },
