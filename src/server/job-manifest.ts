@@ -764,9 +764,28 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     initCommandParts.push(`printf '%s' "$MCP_CONFIG" > /tmp/prompt/mcp.json`);
     initEnv.push({ name: "MCP_CONFIG", value: mergedMcpJson });
   }
+  // Redirect Chrome's BrowserMetrics spool to the per-pod ephemeral
+  // runtime-cache. The `agent-browser` designer tool launches system Chrome
+  // with the default ${dataMountPath}/.config/google-chrome profile; on
+  // headless Chrome's unclean shutdown the ~4MiB *.pma metrics buffers are
+  // never reaped, and they accumulated to 42GiB on the shared CephFS HOME,
+  // walling the whole agent fleet at workspace setup with EDQUOT (BLO-10699).
+  // Only BrowserMetrics is redirected — the rest of the profile (claude.ai
+  // /design auth + cookies) stays persistent on the data PVC. Idempotent:
+  // skip when it is already a symlink (the shared HOME may have been converted
+  // by an earlier pod). The runtime-cache emptyDir is shared with the main
+  // container, so Chrome there writes through the symlink to ephemeral storage
+  // that dies with the pod.
+  initCommandParts.push(
+    `mkdir -p ${dataMountPath}/.config/google-chrome ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics`,
+    `[ -L ${dataMountPath}/.config/google-chrome/BrowserMetrics ] || { rm -rf ${dataMountPath}/.config/google-chrome/BrowserMetrics; ln -sfn ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics ${dataMountPath}/.config/google-chrome/BrowserMetrics; }`,
+  );
   const initVolumeMounts: k8s.V1VolumeMount[] = [
     { name: "data", mountPath: dataMountPath },
     { name: "prompt", mountPath: "/tmp/prompt" },
+    // Needed so the BrowserMetrics symlink target above resolves in the init
+    // container; same emptyDir instance the main container mounts.
+    { name: RUNTIME_CACHE_VOLUME_NAME, mountPath: RUNTIME_CACHE_MOUNT_PATH },
   ];
   if (useLargePromptPath) {
     initVolumeMounts.push({

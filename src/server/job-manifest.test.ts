@@ -311,7 +311,28 @@ describe("buildJobManifest", () => {
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.command?.[0]).toBe("sh");
       expect(init?.command?.[1]).toBe("-c");
-      expect(init?.command?.[2]).toBe("printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt");
+      expect(init?.command?.[2]).toContain("printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt");
+    });
+
+    it("write-prompt redirects Chrome BrowserMetrics to ephemeral runtime-cache (BLO-10699)", () => {
+      // The agent-browser designer tool launches Chrome with the default
+      // /paperclip/.config/google-chrome profile; its BrowserMetrics *.pma
+      // spool leaked 42GiB onto the shared CephFS HOME and walled the fleet
+      // with EDQUOT. Only BrowserMetrics is redirected (profile auth stays
+      // persistent), idempotently, to a per-pod path that dies with the pod.
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const cmd = init?.command?.[2] ?? "";
+      expect(cmd).toContain("[ -L /paperclip/.config/google-chrome/BrowserMetrics ]");
+      expect(cmd).toContain(
+        "ln -sfn /runtime-cache/chrome-browser-metrics /paperclip/.config/google-chrome/BrowserMetrics",
+      );
+    });
+
+    it("write-prompt mounts the runtime-cache emptyDir so the BrowserMetrics symlink target resolves", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.volumeMounts).toContainEqual({ name: "runtime-cache", mountPath: "/runtime-cache" });
     });
 
     it("write-prompt mounts prompt volume", () => {
@@ -962,7 +983,10 @@ describe("buildJobManifest", () => {
     it("init container does not create log directory (server pre-creates it on shared PVC)", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const initCmd = job.spec?.template?.spec?.initContainers?.[0]?.command;
-      expect(initCmd?.[2]).not.toContain("mkdir -p /paperclip");
+      // Narrow guard: the init must not pre-create the instances/run-logs tree
+      // (the server owns that on the shared PVC). Other targeted mkdirs — e.g.
+      // the Chrome BrowserMetrics redirect's `.config/google-chrome` — are fine.
+      expect(initCmd?.[2]).not.toContain("mkdir -p /paperclip/instances");
     });
 
     it("sanitizes companyId with / to valid path component for log path", () => {
