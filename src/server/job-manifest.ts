@@ -10,7 +10,8 @@ import {
   renderTemplate,
 } from "@paperclipai/adapter-utils/server-utils";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 
 /**
@@ -70,6 +71,36 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   PIP_CACHE_DIR: `${RUNTIME_CACHE_MOUNT_PATH}/pip`,
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
 };
+
+function encodeClaudeCwd(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9-]/g, "-");
+}
+
+function resolveClaudeConfigDir(config: Record<string, unknown>, selfPod: SelfPodInfo): string {
+  const envConfig = parseObject(config.env);
+  const configured = asString(envConfig.CLAUDE_CONFIG_DIR, "").trim();
+  if (configured) return configured;
+  const inherited = asString(selfPod.inheritedEnv.CLAUDE_CONFIG_DIR, "").trim();
+  if (inherited) return inherited;
+  return "/paperclip/.claude";
+}
+
+function resolveResumableClaudeSessionId(input: {
+  requestedSessionId: string;
+  workingDir: string;
+  config: Record<string, unknown>;
+  selfPod: SelfPodInfo;
+}): string {
+  const sessionId = input.requestedSessionId.trim();
+  if (!sessionId) return "";
+  const sessionFile = path.join(
+    resolveClaudeConfigDir(input.config, input.selfPod),
+    "projects",
+    encodeClaudeCwd(input.workingDir),
+    `${sessionId}.jsonl`,
+  );
+  return existsSync(sessionFile) ? sessionId : "";
+}
 
 // Inline prompt assembly — these functions are not yet in the published adapter-utils
 function joinPromptSections(sections: string[], separator = "\n\n"): string {
@@ -428,6 +459,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  const claudeResumeSessionId = resolveResumableClaudeSessionId({
+    requestedSessionId: runtimeSessionId,
+    workingDir,
+    config,
+    selfPod,
+  });
   const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -438,10 +475,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     context,
   };
   const renderedBootstrapPrompt =
-    !runtimeSessionId && bootstrapPromptTemplate.trim().length > 0
+    !claudeResumeSessionId && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(runtimeSessionId) });
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(claudeResumeSessionId) });
   // Server's heartbeat composes `context.paperclipTaskMarkdown` for wakes
   // that carry first-class task context (PR-review wakes, issue wakes,
   // wake-comment wakes). renderPaperclipWakePrompt only covers the
@@ -449,7 +486,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // github_pr_* wake reaches the pod with NO PR number / repo in the
   // prompt and the reviewer agent has nothing to act on.
   const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
-  const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
+  const shouldUseResumeDeltaPrompt = Boolean(claudeResumeSessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const prompt = joinPromptSections([
@@ -495,12 +532,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const effectiveInstructionsFilePath =
     promptBundle?.instructionsFilePath ?? (rawInstructionsFilePath || null);
   const claudeArgs = ["--print", "-", "--output-format", "stream-json", "--verbose"];
-  if (runtimeSessionId) claudeArgs.push("--resume", runtimeSessionId);
+  if (claudeResumeSessionId) claudeArgs.push("--resume", claudeResumeSessionId);
   if (dangerouslySkipPermissions) claudeArgs.push("--dangerously-skip-permissions");
   if (model) claudeArgs.push("--model", model);
   if (effort) claudeArgs.push("--effort", effort);
   if (maxTurns > 0) claudeArgs.push("--max-turns", String(maxTurns));
-  if (effectiveInstructionsFilePath && !runtimeSessionId) {
+  if (effectiveInstructionsFilePath && !claudeResumeSessionId) {
     claudeArgs.push("--append-system-prompt-file", effectiveInstructionsFilePath);
   }
   if (promptBundle) claudeArgs.push("--add-dir", promptBundle.addDir);
