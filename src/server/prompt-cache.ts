@@ -130,11 +130,12 @@ export async function prepareClaudePromptBundle(input: {
   companyId: string;
   skills: PaperclipSkillEntry[];
   instructionsContents: string | null;
+  rootDir?: string | null;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<ClaudePromptBundle> {
   const { companyId, skills, instructionsContents, onLog } = input;
   const bundleKey = await buildClaudePromptBundleKey({ skills, instructionsContents });
-  const rootDir = path.join(resolveManagedClaudePromptCacheRoot(companyId), bundleKey);
+  const rootDir = path.join(input.rootDir?.trim() || resolveManagedClaudePromptCacheRoot(companyId), bundleKey);
   const skillsHome = path.join(rootDir, ".claude", "skills");
   await fs.mkdir(skillsHome, { recursive: true });
 

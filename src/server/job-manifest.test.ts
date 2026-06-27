@@ -56,7 +56,7 @@ describe("buildJobManifest", () => {
     ctx = makeCtx();
     selfPod = makeSelfPod();
     tempDirs = [];
-    delete process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH;
+    process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH = "";
   });
 
   afterEach(() => {
@@ -180,6 +180,13 @@ describe("buildJobManifest", () => {
       ctx.runtime = { ...ctx.runtime, sessionId: "sess-abc-1234" };
       const { job } = buildJobManifest({ ctx, selfPod });
       expect(job.metadata?.labels?.["paperclip.io/session-id"]).toBe("sess-abc-1234");
+    });
+
+    it("adds isolation labels in isolated mode", () => {
+      ctx.config = { isolationMode: "isolated", isolationKey: "pr-review-123" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("isolated");
+      expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBe("pr-review-123");
     });
 
     it("reads sessionId from runtime.sessionParams when sessionId prop missing", () => {
@@ -472,6 +479,20 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const home = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "HOME");
       expect(home?.value).toBe("/paperclip");
+    });
+
+    it("scopes HOME, Claude config, caches, cwd, and logs to the isolation key", () => {
+      ctx.config = { isolationMode: "isolated", isolationKey: "pr-review-123" };
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
+      const container = job.spec?.template?.spec?.containers[0];
+      const env = new Map(container?.env?.map((e) => [e.name, e.value]));
+      const root = "/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/pr-review-123";
+      expect(container?.workingDir).toBe(`${root}/workspace`);
+      expect(env.get("HOME")).toBe(`${root}/home`);
+      expect(env.get("CLAUDE_CONFIG_DIR")).toBe(`${root}/home/.claude`);
+      expect(env.get("XDG_CACHE_HOME")).toBe(`${root}/cache/xdg`);
+      expect(env.get("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("pr-review-123");
+      expect(podLogPath).toBe("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123/run-abc12345.pod.ndjson");
     });
 
     it("defaults build and package caches to runtime-cache emptyDir", () => {
@@ -1100,6 +1121,7 @@ describe("per-agent mcp.json layering", () => {
   beforeEach(() => {
     ctx = makeCtx();
     selfPod = makeSelfPod();
+    process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH = "";
   });
 
   it("does not inject --mcp-config when adapterConfig.mcpServers is empty", () => {

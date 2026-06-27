@@ -25,12 +25,15 @@ import type { ClaudePromptBundle } from "./prompt-cache.js";
 const DEFAULT_SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
 
 function sharedMcpBaselinePath(): string {
+  if (process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH === "") return "";
   return process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH || DEFAULT_SHARED_MCP_BASELINE_PATH;
 }
 
 function loadSharedMcpBaseline(): Record<string, unknown> {
+  const baselinePath = sharedMcpBaselinePath();
+  if (!baselinePath) return {};
   try {
-    const raw = readFileSync(sharedMcpBaselinePath(), "utf8");
+    const raw = readFileSync(baselinePath, "utf8");
     const parsed = JSON.parse(raw) as { mcpServers?: unknown };
     if (parsed && typeof parsed === "object" && parsed.mcpServers && typeof parsed.mcpServers === "object") {
       return parsed.mcpServers as Record<string, unknown>;
@@ -52,8 +55,11 @@ function sanitizeForK8sPath(value: string): string {
   return value.replace(/[^a-zA-Z0-9-]/g, "");
 }
 
-export function buildPodLogPath(companyId: string, agentId: string, runId: string): string {
-  return `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
+export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
+  const dir = isolationKey
+    ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
+    : `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}`;
+  return `${dir}/${runId}.pod.ndjson`;
 }
 
 /** Prompts above this size (bytes) are staged via a Secret instead of an
@@ -71,6 +77,39 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   PIP_CACHE_DIR: `${RUNTIME_CACHE_MOUNT_PATH}/pip`,
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
 };
+
+type JobIsolation = {
+  enabled: boolean;
+  key: string;
+  root: string;
+  homeRoot: string;
+  workspaceRoot: string;
+  cacheRoot: string;
+  promptCacheRoot: string;
+};
+
+function resolveJobIsolation(config: Record<string, unknown>, agent: AdapterExecutionContext["agent"]): JobIsolation {
+  const mode = asString(config.isolationMode, "shared").trim().toLowerCase();
+  const enabled = mode === "isolated" || mode === "isolate";
+  if (!enabled) {
+    return { enabled: false, key: "", root: "", homeRoot: "", workspaceRoot: "", cacheRoot: "", promptCacheRoot: "" };
+  }
+
+  const rawKey = asString(config.isolationKey, "").trim();
+  if (!rawKey) throw new Error("isolationMode=isolated requires isolationKey");
+  const key = sanitizeForK8sPath(rawKey) || shortHash(rawKey);
+  assertSafePathComponent("isolationKey", key);
+  const companyId = sanitizeForK8sPath(agent.companyId);
+  const agentId = sanitizeForK8sPath(agent.id);
+  assertSafePathComponent("companyId", companyId);
+  assertSafePathComponent("agentId", agentId);
+  const root = asString(config.isolationRoot, "").trim() || `/paperclip/instances/default/data/k8s-isolation/${companyId}/${agentId}/${key}`;
+  const homeRoot = asString(config.homeRoot, "").trim() || `${root}/home`;
+  const workspaceRoot = asString(config.workspaceRoot, "").trim() || `${root}/workspace`;
+  const cacheRoot = asString(config.cacheRoot, "").trim() || `${root}/cache`;
+  const promptCacheRoot = asString(config.promptCacheRoot, "").trim() || `${root}/prompt-cache`;
+  return { enabled, key, root, homeRoot, workspaceRoot, cacheRoot, promptCacheRoot };
+}
 
 function encodeClaudeCwd(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9-]/g, "-");
@@ -240,6 +279,7 @@ function buildEnvVars(
   ctx: AdapterExecutionContext,
   selfPod: SelfPodInfo,
   config: Record<string, unknown>,
+  isolation: JobIsolation,
 ): k8s.V1EnvVar[] {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
@@ -324,9 +364,26 @@ function buildEnvVars(
     if (typeof value === "string") merged[key] = value;
   }
 
-  // HOME must be /paperclip to match PVC mount and enable session resume
-  merged.HOME = "/paperclip";
-  for (const [key, value] of Object.entries(RUNTIME_CACHE_ENV)) {
+  // HOME must live on the mounted data PVC to enable session resume. Isolated
+  // mode scopes Claude config/cache/session state away from shared /paperclip.
+  merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
+  if (isolation.enabled) {
+    merged.CLAUDE_CONFIG_DIR = `${isolation.homeRoot}/.claude`;
+    merged.XDG_CONFIG_HOME = `${isolation.homeRoot}/.config`;
+    merged.PAPERCLIP_K8S_ISOLATION_KEY = isolation.key;
+  }
+  const cacheEnv = isolation.enabled
+    ? {
+        XDG_CACHE_HOME: `${isolation.cacheRoot}/xdg`,
+        GOCACHE: `${isolation.cacheRoot}/go-build`,
+        GOMODCACHE: `${isolation.cacheRoot}/gomod`,
+        npm_config_cache: `${isolation.cacheRoot}/npm`,
+        BUN_INSTALL_CACHE: `${isolation.cacheRoot}/bun`,
+        PIP_CACHE_DIR: `${isolation.cacheRoot}/pip`,
+        PLAYWRIGHT_BROWSERS_PATH: `${isolation.cacheRoot}/ms-playwright`,
+      }
+    : RUNTIME_CACHE_ENV;
+  for (const [key, value] of Object.entries(cacheEnv)) {
     if (!userEnvKeys.has(key)) merged[key] = value;
   }
 
@@ -436,12 +493,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configuredTolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
   const tolerations = hasConfigKey("tolerations") ? configuredTolerations : selfPod.tolerations;
   const extraLabels = parseKeyValueConfig(config.labels);
+  const isolation = resolveJobIsolation(config, agent);
 
   // Resolve working directory — use workspace cwd, fall back to /paperclip
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const configuredCwd = asString(config.cwd, "");
-  const workingDir = workspaceCwd || configuredCwd || "/paperclip";
+  const workingDir = isolation.enabled ? isolation.workspaceRoot : workspaceCwd || configuredCwd || "/paperclip";
 
   // Build a deterministic, collision-resistant job name within the 63-char
   // DNS label limit.  Layout: "ac-{agentSlug}-{runSlug}-{hash}" where the
@@ -552,7 +610,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (extraArgs.length > 0) claudeArgs.push(...extraArgs);
 
   // Build env vars
-  const envVars = buildEnvVars(ctx, selfPod, config);
+  const envVars = buildEnvVars(ctx, selfPod, config, isolation);
 
   // Resource defaults — UI stores dotted keys (e.g. "resources.requests.cpu")
   // as flat config entries, so read them directly from config with the dotted key.
@@ -592,6 +650,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (taskLabel) labels["paperclip.io/task-id"] = taskLabel;
   const sessionLabel = runtimeSessionId ? sanitizeLabelValue(runtimeSessionId) : null;
   if (sessionLabel) labels["paperclip.io/session-id"] = sessionLabel;
+  if (isolation.enabled) {
+    labels["paperclip.io/isolation-mode"] = "isolated";
+    labels["paperclip.io/isolation-key"] = isolation.key;
+  }
   for (const [key, value] of Object.entries(extraLabels)) {
     if (key.startsWith("paperclip.io/") || key.startsWith("app.kubernetes.io/")) {
       skippedLabels.push(key);
@@ -683,7 +745,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   assertSafePathComponent("companyId", logPathCompanyId);
   assertSafePathComponent("agentId", logPathAgentId);
   assertSafePathComponent("runId", logPathRunId);
-  const podLogPath = buildPodLogPath(logPathCompanyId, logPathAgentId, logPathRunId);
+  const podLogPath = buildPodLogPath(logPathCompanyId, logPathAgentId, logPathRunId, isolation.enabled ? isolation.key : undefined);
   // Refresh OAuth credentials via ccrotate before invoking claude. The shared
   // /paperclip/.claude/.credentials.json on the RWX PVC may contain an expired
   // access token (claude OAuth tokens last ~30-60 min and the paperclip pod
@@ -813,9 +875,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // by an earlier pod). The runtime-cache emptyDir is shared with the main
   // container, so Chrome there writes through the symlink to ephemeral storage
   // that dies with the pod.
+  const browserHome = isolation.enabled ? isolation.homeRoot : dataMountPath;
+  const browserMetricsTarget = isolation.enabled ? `${isolation.cacheRoot}/chrome-browser-metrics` : `${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics`;
   initCommandParts.push(
-    `mkdir -p ${dataMountPath}/.config/google-chrome ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics`,
-    `[ -L ${dataMountPath}/.config/google-chrome/BrowserMetrics ] || { rm -rf ${dataMountPath}/.config/google-chrome/BrowserMetrics; ln -sfn ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics ${dataMountPath}/.config/google-chrome/BrowserMetrics; }`,
+    ...(isolation.enabled ? [`mkdir -p ${isolation.homeRoot} ${isolation.workspaceRoot} ${isolation.cacheRoot} ${isolation.promptCacheRoot}`] : []),
+    `mkdir -p ${browserHome}/.config/google-chrome ${browserMetricsTarget}`,
+    `[ -L ${browserHome}/.config/google-chrome/BrowserMetrics ] || { rm -rf ${browserHome}/.config/google-chrome/BrowserMetrics; ln -sfn ${browserMetricsTarget} ${browserHome}/.config/google-chrome/BrowserMetrics; }`,
   );
   const initVolumeMounts: k8s.V1VolumeMount[] = [
     { name: "data", mountPath: dataMountPath },

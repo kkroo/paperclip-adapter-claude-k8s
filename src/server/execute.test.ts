@@ -71,6 +71,7 @@ function makeJob(opts: {
   agentId?: string;
   taskId?: string;
   sessionId?: string;
+  isolationKey?: string;
   adapterType?: string;
   terminal?: boolean;
 }): k8s.V1Job {
@@ -81,6 +82,7 @@ function makeJob(opts: {
   if (opts.runId) labels["paperclip.io/run-id"] = opts.runId;
   if (opts.taskId) labels["paperclip.io/task-id"] = opts.taskId;
   if (opts.sessionId) labels["paperclip.io/session-id"] = opts.sessionId;
+  if (opts.isolationKey) labels["paperclip.io/isolation-key"] = opts.isolationKey;
   return {
     metadata: { name: "ac-job", namespace: "paperclip", labels },
     status: opts.terminal
@@ -615,6 +617,40 @@ describe("execute: concurrency guard", () => {
     expect(mockBatchDeleteJob).not.toHaveBeenCalled();
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(result.errorMessage).toContain("active run");
+  });
+
+  it("allows active jobs with a different isolation key", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const other = makeJob({ runId: "active-run", agentId: "agent-abc", taskId: "task-other", isolationKey: "other-key" });
+    mockBatchListJobs.mockResolvedValue({ items: [other] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+    }));
+
+    const result = await execute(makeCtx({ config: { isolationMode: "isolated", isolationKey: "current-key" } }));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("create reached");
+  });
+
+  it("blocks active jobs with the same isolation key", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const same = makeJob({ runId: "active-run", agentId: "agent-abc", taskId: "task-current", isolationKey: "same-key" });
+    mockBatchListJobs.mockResolvedValue({ items: [same] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+    }));
+
+    const result = await execute(makeCtx({ config: { isolationMode: "isolated", isolationKey: "same-key" } }));
+
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
   });
 
   it("still blocks unlabeled jobs as unknown orphans without consulting the run table", async () => {
