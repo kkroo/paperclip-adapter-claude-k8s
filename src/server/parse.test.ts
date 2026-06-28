@@ -7,6 +7,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
+  isClaudeTransientUpstreamError,
 } from "./parse.js";
 
 describe("parseClaudeStreamJson", () => {
@@ -279,6 +280,42 @@ more raw output`;
     });
     const result = parseClaudeStreamJson(resultEvent);
     expect(result.llmApiEmptyResponse).toBe(false);
+  });
+});
+
+describe("isClaudeTransientUpstreamError", () => {
+  it("classifies malformed HTTP 200 API responses as transient upstream", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          result: "API Error: API returned an empty or malformed response (HTTP 200)",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not classify deterministic Claude failures as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { subtype: "error_max_turns", result: "Maximum turns reached." },
+      }),
+    ).toBe(false);
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { result: "Please log in. Run `claude login` first." },
+      }),
+    ).toBe(false);
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          result:
+            "API Error: 400 messages.65.content.172: `thinking` blocks in the latest assistant message cannot be modified.",
+        },
+      }),
+    ).toBe(false);
   });
 });
 

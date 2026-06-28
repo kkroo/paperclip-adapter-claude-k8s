@@ -16,6 +16,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
+  isClaudeTransientUpstreamError,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
 import { buildJobManifest, buildPodLogPath, sanitizeLabelValue } from "./job-manifest.js";
@@ -1613,15 +1614,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     : null;
 
   const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
+  const failed = (exitCode ?? 0) !== 0;
+  const errorMessage = failed
+    ? describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`
+    : null;
+  const transientUpstream = failed && isClaudeTransientUpstreamError({
+    parsed,
+    stdout,
+    errorMessage,
+  });
+  const resultJson = transientUpstream
+    ? { ...parsed, errorFamily: "transient_upstream" }
+    : parsed;
 
   return {
     exitCode,
     signal: null,
     timedOut: false,
-    errorMessage:
-      (exitCode ?? 0) === 0
-        ? null
-        : describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`,
+    errorMessage,
+    errorCode: transientUpstream ? "claude_transient_upstream" : null,
+    errorFamily: transientUpstream ? "transient_upstream" : null,
     usage,
     sessionId: resolvedSessionId || null,
     sessionParams: resolvedSessionParams,
@@ -1630,7 +1642,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     model: parsedStream.model || asString(parsed.model as string, model),
     billingType: "api",
     costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
-    resultJson: parsed,
+    resultJson,
     summary: parsedStream.summary || asString(parsed.result as string, ""),
     clearSession: clearSessionForMaxTurns,
   } as AdapterExecutionResult;
