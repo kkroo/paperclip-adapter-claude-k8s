@@ -2,7 +2,7 @@ import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEn
 import fs from "node:fs/promises";
 import path from "node:path";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
-import { parseClaudeStreamJson, describeClaudeFailure, isClaudeMaxTurnsResult, isClaudeUnknownSessionError, isClaudeImmutableThinkingBlockError, } from "./parse.js";
+import { parseClaudeStreamJson, describeClaudeFailure, isClaudeMaxTurnsResult, isClaudeUnknownSessionError, isClaudeImmutableThinkingBlockError, isClaudeTransientUpstreamError, } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
 import { buildJobManifest, sanitizeLabelValue } from "./job-manifest.js";
 const POLL_INTERVAL_MS = 2000;
@@ -1434,13 +1434,25 @@ export async function execute(ctx) {
         }
         : null;
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
+    const failed = (exitCode ?? 0) !== 0;
+    const errorMessage = failed
+        ? describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`
+        : null;
+    const transientUpstream = failed && isClaudeTransientUpstreamError({
+        parsed,
+        stdout,
+        errorMessage,
+    });
+    const resultJson = transientUpstream
+        ? { ...parsed, errorFamily: "transient_upstream" }
+        : parsed;
     return {
         exitCode,
         signal: null,
         timedOut: false,
-        errorMessage: (exitCode ?? 0) === 0
-            ? null
-            : describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`,
+        errorMessage,
+        errorCode: transientUpstream ? "claude_transient_upstream" : null,
+        errorFamily: transientUpstream ? "transient_upstream" : null,
         usage,
         sessionId: resolvedSessionId || null,
         sessionParams: resolvedSessionParams,
@@ -1449,7 +1461,7 @@ export async function execute(ctx) {
         model: parsedStream.model || asString(parsed.model, model),
         billingType: "api",
         costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
-        resultJson: parsed,
+        resultJson,
         summary: parsedStream.summary || asString(parsed.result, ""),
         clearSession: clearSessionForMaxTurns,
     };

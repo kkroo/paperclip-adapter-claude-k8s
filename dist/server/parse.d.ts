@@ -22,4 +22,10 @@ export declare function describeClaudeFailure(parsed: Record<string, unknown>): 
 export declare function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean;
 export declare function isClaudeUnknownSessionError(parsed: Record<string, unknown>): boolean;
 export declare function isClaudeImmutableThinkingBlockError(parsed: Record<string, unknown>): boolean;
+export declare function isClaudeTransientUpstreamError(input: {
+    parsed?: Record<string, unknown> | null;
+    stdout?: string | null;
+    stderr?: string | null;
+    errorMessage?: string | null;
+}): boolean;
 //# sourceMappingURL=parse.d.ts.map

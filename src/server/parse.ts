@@ -3,6 +3,8 @@ import { asString, asNumber, parseObject, parseJson } from "@paperclipai/adapter
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
+const CLAUDE_TRANSIENT_UPSTREAM_RE =
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|api\s+returned\s+an\s+empty\s+or\s+malformed\s+response)/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -232,4 +234,53 @@ export function isClaudeImmutableThinkingBlockError(parsed: Record<string, unkno
     /thinking|redacted_thinking/i.test(msg) &&
     /latest assistant message cannot be modified|blocks must remain as they were in the original response/i.test(msg),
   );
+}
+
+function buildClaudeTransientHaystack(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  const parsed = input.parsed ?? null;
+  const resultText = parsed ? asString(parsed.result, "") : "";
+  const parsedErrors = parsed ? extractClaudeErrorMessages(parsed) : [];
+  return [
+    input.errorMessage ?? "",
+    resultText,
+    ...parsedErrors,
+    input.stdout ?? "",
+    input.stderr ?? "",
+  ]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function isClaudeTransientUpstreamError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  if (parsed && (
+    isClaudeMaxTurnsResult(parsed) ||
+    isClaudeUnknownSessionError(parsed) ||
+    isClaudeImmutableThinkingBlockError(parsed)
+  )) {
+    return false;
+  }
+  const loginMeta = detectClaudeLoginRequired({
+    parsed,
+    stdout: input.stdout ?? "",
+    stderr: input.stderr ?? "",
+  });
+  if (loginMeta.requiresLogin) return false;
+
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return false;
+  return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
