@@ -533,18 +533,21 @@ export function describePodTerminatedError(
 async function waitForPod(
   namespace: string,
   jobName: string,
-  timeoutMs: number,
+  scheduleTimeoutMs: number,
+  startTimeoutMs: number,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
 ): Promise<string> {
   const coreApi = getCoreApi(kubeconfigPath);
-  const deadline = Date.now() + timeoutMs;
+  const scheduleDeadline = Date.now() + scheduleTimeoutMs;
   const labelSelector = `job-name=${jobName}`;
 
   await onLog("stdout", `[paperclip] Waiting for pod to be scheduled (job: ${jobName})...\n`);
 
   let lastStatus = "";
-  while (Date.now() < deadline) {
+  let lastStatusDetails = "no pod observed yet";
+  let startDeadline = 0;
+  while (true) {
     const podList = await coreApi.listNamespacedPod({
       namespace,
       labelSelector,
@@ -552,6 +555,9 @@ async function waitForPod(
     const pod = podList.items[0];
 
     if (!pod) {
+      if (Date.now() >= scheduleDeadline) {
+        throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
+      }
       if (lastStatus !== "no-pod") {
         await onLog("stdout", `[paperclip] Waiting for Job controller to create pod...\n`);
         lastStatus = "no-pod";
@@ -562,6 +568,9 @@ async function waitForPod(
 
     const podName = pod.metadata?.name ?? "unknown";
     const phase = pod.status?.phase ?? "Unknown";
+    const conditions = pod.status?.conditions ?? [];
+    const scheduledCondition = conditions.find((c) => c.type === "PodScheduled");
+    const isScheduled = Boolean(pod.spec?.nodeName) || scheduledCondition?.status === "True";
     const initStatuses = pod.status?.initContainerStatuses ?? [];
     const containerStatuses = pod.status?.containerStatuses ?? [];
 
@@ -581,6 +590,12 @@ async function waitForPod(
       }
       await onLog("stdout", `[paperclip] Pod ${podName}: ${details.join(", ")}\n`);
       lastStatus = statusKey;
+      lastStatusDetails = details.join(", ");
+    }
+
+    if (isScheduled && startDeadline === 0) {
+      startDeadline = Date.now() + startTimeoutMs;
+      await onLog("stdout", `[paperclip] Pod ${podName} scheduled; waiting for containers to start...\n`);
     }
 
     // Ready to stream logs
@@ -619,12 +634,18 @@ async function waitForPod(
     }
 
     // Check for unrecoverable scheduling failures
-    const conditions = pod.status?.conditions ?? [];
     const unschedulable = conditions.find(
       (c) => c.type === "PodScheduled" && c.status === "False" && c.reason === "Unschedulable",
     );
     if (unschedulable) {
       throw new Error(`Pod unschedulable: ${unschedulable.message ?? "insufficient resources"}`);
+    }
+
+    if (!isScheduled && Date.now() >= scheduleDeadline) {
+      throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
+    }
+    if (isScheduled && startDeadline > 0 && Date.now() >= startDeadline) {
+      throw new Error(`Timed out waiting for pod containers to start (${Math.round(startTimeoutMs / 1000)}s): ${lastStatusDetails}`);
     }
 
     // Check for main container image pull errors
@@ -640,8 +661,6 @@ async function waitForPod(
 
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
-
-  throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(timeoutMs / 1000)}s)`);
 }
 
 /**
@@ -1231,21 +1250,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     // Wait for pod to be ready for log streaming
-    const scheduleTimeoutMs = 120_000; // 2 minutes for scheduling
+    const scheduleTimeoutMs = Math.max(0, asNumber(config.podScheduleTimeoutSec, 120)) * 1000;
+    const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 600)) * 1000;
     let podName: string;
     try {
-      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
+      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
       podRunningAt = Date.now();
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Pod scheduling failed: ${msg}\n`);
+      const startupFailure = msg.includes("pod containers to start");
+      const failureLabel = startupFailure ? "Pod startup failed" : "Pod scheduling failed";
+      await onLog("stderr", `[paperclip] ${failureLabel}: ${msg}\n`);
       return {
         exitCode: null,
         signal: null,
         timedOut: false,
-        errorMessage: `Pod scheduling failed: ${msg}`,
+        errorMessage: `${failureLabel}: ${msg}`,
         errorCode: "k8s_pod_schedule_failed",
       };
     }
