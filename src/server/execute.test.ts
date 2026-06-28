@@ -798,6 +798,39 @@ describe("execute: waitForPod edge cases", () => {
     expect(result.errorMessage).toContain("OOMKilled");
   });
 
+  it("uses the startup timeout after the pod is already scheduled", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-starting" },
+        spec: { nodeName: "k8s-paperclip-1" },
+        status: {
+          phase: "Pending",
+          conditions: [{ type: "PodScheduled", status: "True" }],
+          initContainerStatuses: [{
+            name: "write-prompt",
+            state: { terminated: { exitCode: 0, reason: "Completed" } },
+          }],
+          containerStatuses: [{
+            name: "claude",
+            state: { waiting: { reason: "PodInitializing" } },
+          }],
+        },
+      }],
+    });
+
+    const ctx = makeCtx({ config: { podStartTimeoutSec: 0 } } as Partial<AdapterExecutionContext>);
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Pod startup failed");
+    expect(result.errorMessage).toContain("containers to start");
+    expect(result.errorMessage).not.toContain("Timed out waiting for pod to be scheduled");
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("scheduled; waiting for containers to start"),
+    );
+  });
+
   it("throws k8s_pod_schedule_failed when init container exits non-zero", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
