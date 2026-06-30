@@ -219,7 +219,7 @@ Agent-level configuration fields set in `adapterConfig`:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | — | Claude model id (e.g., `claude-sonnet-4-6`) |
+| `model` | string | — | Claude model id (e.g., `claude-sonnet-5`) |
 | `effort` | string | — | Reasoning effort: `low`, `medium`, or `high` |
 | `maxTurnsPerRun` | number | 0 | Max turns per run (0 = unlimited) |
 | `dangerouslySkipPermissions` | boolean | `true` | Skip permission prompts (required for unattended Jobs) |

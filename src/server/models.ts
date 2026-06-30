@@ -2,6 +2,7 @@ import type { AdapterModel } from "@paperclipai/adapter-utils";
 
 const DIRECT_MODELS: AdapterModel[] = [
   { id: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 (1M)" },
+  { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-sonnet-4-6[1m]", label: "Claude Sonnet 4.6 (1M)" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
@@ -13,6 +14,7 @@ const DIRECT_MODELS: AdapterModel[] = [
 
 const BEDROCK_MODELS: AdapterModel[] = [
   { id: "us.anthropic.claude-opus-4-7", label: "Bedrock Opus 4.7" },
+  { id: "us.anthropic.claude-sonnet-5", label: "Bedrock Sonnet 5" },
   { id: "us.anthropic.claude-opus-4-6-v1", label: "Bedrock Opus 4.6" },
   { id: "us.anthropic.claude-sonnet-4-6", label: "Bedrock Sonnet 4.6" },
   { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", label: "Bedrock Sonnet 4.5" },
