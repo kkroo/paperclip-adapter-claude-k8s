@@ -15,13 +15,14 @@ function extractSessionFields(record: Record<string, unknown>) {
   const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
   const promptBundleKey =
     readNonEmptyString(record.promptBundleKey) ?? readNonEmptyString(record.prompt_bundle_key);
-  return { sessionId, cwd, workspaceId, repoUrl, repoRef, promptBundleKey };
+  const model = readNonEmptyString(record.model);
+  return { sessionId, cwd, workspaceId, repoUrl, repoRef, promptBundleKey, model };
 }
 
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
-    const { sessionId, cwd, workspaceId, repoUrl, repoRef, promptBundleKey } =
+    const { sessionId, cwd, workspaceId, repoUrl, repoRef, promptBundleKey, model } =
       extractSessionFields(raw as Record<string, unknown>);
     if (!sessionId) return null;
     return {
@@ -31,11 +32,12 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(model ? { model } : {}),
     };
   },
   serialize(params: Record<string, unknown> | null) {
     if (!params) return null;
-    const { sessionId, cwd, workspaceId, repoUrl, repoRef, promptBundleKey } =
+    const { sessionId, cwd, workspaceId, repoUrl, repoRef, promptBundleKey, model } =
       extractSessionFields(params);
     if (!sessionId) return null;
     return {
@@ -45,6 +47,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(model ? { model } : {}),
     };
   },
   getDisplayId(params: Record<string, unknown> | null) {

@@ -13,6 +13,8 @@ function isBedrockEnv(): boolean {
 }
 
 const DIRECT_MODELS: AdapterModel[] = [
+  { id: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 (1M)" },
+  { id: "claude-sonnet-4-6[1m]", label: "Claude Sonnet 4.6 (1M)" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },

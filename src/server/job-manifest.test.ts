@@ -723,6 +723,55 @@ describe("buildJobManifest", () => {
       expect(claudeArgs).toContain("sess_abc");
     });
 
+    it("adds --resume when configured model matches session model", () => {
+      const configDir = createClaudeConfigDirWithSession("sess_abc");
+      tempDirs.push(configDir);
+      ctx.config = {
+        model: "claude-sonnet-4-6[1m]",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      };
+      ctx.runtime.sessionParams = {
+        sessionId: "sess_abc",
+        model: "claude-sonnet-4-6[1m]",
+      };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).toContain("--resume");
+      expect(claudeArgs).toContain("sess_abc");
+    });
+
+    it("starts a fresh Claude session when configured model differs from session model", () => {
+      const configDir = createClaudeConfigDirWithSession("sess_abc");
+      tempDirs.push(configDir);
+      ctx.config = {
+        model: "claude-sonnet-4-6[1m]",
+        instructionsFilePath: "/paperclip/instructions.md",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      };
+      ctx.runtime.sessionParams = {
+        sessionId: "sess_abc",
+        model: "claude-sonnet-4-5",
+      };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).not.toContain("--resume");
+      expect(claudeArgs).not.toContain("sess_abc");
+      expect(claudeArgs).toContain("--append-system-prompt-file");
+    });
+
+    it("starts a fresh Claude session when configured model has no recorded session model", () => {
+      const configDir = createClaudeConfigDirWithSession("sess_abc");
+      tempDirs.push(configDir);
+      ctx.config = {
+        model: "claude-sonnet-4-6[1m]",
+        instructionsFilePath: "/paperclip/instructions.md",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      };
+      ctx.runtime.sessionParams = { sessionId: "sess_abc" };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).not.toContain("--resume");
+      expect(claudeArgs).not.toContain("sess_abc");
+      expect(claudeArgs).toContain("--append-system-prompt-file");
+    });
+
     it("starts a fresh Claude session when runtime sessionId has no local Claude session file", () => {
       const configDir = mkdtempSync(join(tmpdir(), "claude-k8s-session-missing-"));
       tempDirs.push(configDir);

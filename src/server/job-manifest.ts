@@ -126,12 +126,16 @@ function resolveClaudeConfigDir(config: Record<string, unknown>, selfPod: SelfPo
 
 function resolveResumableClaudeSessionId(input: {
   requestedSessionId: string;
+  requestedModel: string;
+  sessionModel: string;
   workingDir: string;
   config: Record<string, unknown>;
   selfPod: SelfPodInfo;
 }): string {
   const sessionId = input.requestedSessionId.trim();
   if (!sessionId) return "";
+  const requestedModel = input.requestedModel.trim();
+  if (requestedModel && input.sessionModel.trim() !== requestedModel) return "";
   const sessionFile = path.join(
     resolveClaudeConfigDir(input.config, input.selfPod),
     "projects",
@@ -517,8 +521,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  const runtimeSessionModel = asString(runtimeSessionParams.model, "");
   const claudeResumeSessionId = resolveResumableClaudeSessionId({
     requestedSessionId: runtimeSessionId,
+    requestedModel: model,
+    sessionModel: runtimeSessionModel,
     workingDir,
     config,
     selfPod,

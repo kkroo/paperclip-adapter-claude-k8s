@@ -1679,6 +1679,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const resolvedSessionParams = resolvedSessionId
     ? {
         sessionId: resolvedSessionId,
+        ...(model ? { model } : {}),
         ...(cwd ? { cwd } : {}),
         ...(workspaceId ? { workspaceId } : {}),
         ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
