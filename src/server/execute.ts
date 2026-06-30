@@ -81,6 +81,33 @@ const activeJobs = new Set<ActiveJobRef>();
 const agentCreationMutex = new Map<string, Promise<void>>();
 let sigtermHandlerRegistered = false;
 
+function resolveIsolationMutexKey(config: Record<string, unknown>, agentId: string): { mutexKey: string; isolationKey: string | null } {
+  const mode = asString(config.isolationMode, "shared").trim().toLowerCase();
+  const enabled = mode === "isolated" || mode === "isolate";
+  if (!enabled) return { mutexKey: agentId, isolationKey: null };
+  const rawKey = asString(config.isolationKey, "").trim();
+  if (!rawKey) throw new Error("isolationMode=isolated requires isolationKey");
+  const isolationKey = sanitizePathComponent(rawKey);
+  if (!isolationKey) throw new Error(`Isolation key "${rawKey}" cannot be sanitized to a valid Kubernetes label`);
+  return { mutexKey: `${agentId}:${isolationKey}`, isolationKey };
+}
+
+function sanitizePathComponent(value: string): string {
+  return value.replace(/[^a-zA-Z0-9-]/g, "");
+}
+
+function safePathComponent(value: string): string {
+  return sanitizePathComponent(value) || "unknown";
+}
+
+function resolvePromptCacheRoot(config: Record<string, unknown>, ctx: AdapterExecutionContext, isolationKey: string | null): string | null {
+  const configured = asString(config.promptCacheRoot, "").trim();
+  if (configured) return configured;
+  if (!isolationKey) return null;
+  const root = asString(config.isolationRoot, "").trim() || `/paperclip/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolationKey}`;
+  return `${root}/prompt-cache`;
+}
+
 function ensureSigtermHandler(): void {
   if (sigtermHandlerRegistered) return;
   sigtermHandlerRegistered = true;
@@ -900,6 +927,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
+  let isolationKey: string | null = null;
+  let creationMutexKey = "";
+  try {
+    const isolation = resolveIsolationMutexKey(config, ctx.agent.id);
+    isolationKey = isolation.isolationKey;
+    creationMutexKey = isolation.mutexKey;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await onLog("stderr", `[paperclip] Cannot create K8s Job: ${msg}\n`);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: msg,
+      errorCode: "k8s_isolation_key_invalid",
+    };
+  }
   // K8sRemoteSpec.kubeconfig is *content* (resolved by the env driver), but
   // the adapter's existing config interprets `kubeconfig` as a filesystem
   // path. When the env supplies null we fall through to in-cluster auth as
@@ -934,11 +978,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // FAR-29: serialize guard+create per agent within this process to prevent the
   // TOCTOU race where two concurrent execute() calls both pass the list-then-create
   // guard and create K8s Jobs simultaneously on the shared PVC.
-  const _prevCreation = agentCreationMutex.get(agentId) ?? Promise.resolve();
+  const _prevCreation = agentCreationMutex.get(creationMutexKey) ?? Promise.resolve();
   let _releaseMutex: () => void = () => {};
   const _mutexSlot = new Promise<void>((resolve) => { _releaseMutex = resolve; });
   // Chain: next caller for this agent waits on _mutexSlot, which resolves in finally.
-  agentCreationMutex.set(agentId, _prevCreation.then(() => _mutexSlot, () => _mutexSlot));
+  agentCreationMutex.set(creationMutexKey, _prevCreation.then(() => _mutexSlot, () => _mutexSlot));
   // Wait for any prior execute() call to finish its guard+create phase.
   await _prevCreation.catch(() => {});
 
@@ -998,6 +1042,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         if (!priorRun || !isActiveHeartbeatRun(priorRun)) {
           await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath);
           await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
+          continue;
+        }
+
+        const jobIsolationKey = job.metadata?.labels?.["paperclip.io/isolation-key"] ?? null;
+        if (isolationKey && jobIsolationKey !== isolationKey) {
+          await onLog("stdout", `[paperclip] Allowing concurrent Job ${jobName}: isolation-key ${jobIsolationKey ?? "shared"} differs from ${isolationKey}.\n`);
           continue;
         }
 
@@ -1086,6 +1136,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     companyId: ctx.agent.companyId,
     skills: desiredSkills,
     instructionsContents,
+    rootDir: resolvePromptCacheRoot(config, ctx, isolationKey),
     onLog,
   });
 
