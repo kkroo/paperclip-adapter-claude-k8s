@@ -116,12 +116,19 @@ describe("sessionCodec", () => {
         sessionId: "sess_abc",
         cwd: "/work",
         promptBundleKey: "bundle-key-123",
+        model: "claude-sonnet-4-6[1m]",
       });
       expect(result).toEqual({
         sessionId: "sess_abc",
         cwd: "/work",
         promptBundleKey: "bundle-key-123",
+        model: "claude-sonnet-4-6[1m]",
       });
+    });
+
+    it("omits model when empty", () => {
+      const result = deserialize({ sessionId: "s", model: "" });
+      expect(result).not.toHaveProperty("model");
     });
   });
 
@@ -152,6 +159,7 @@ describe("sessionCodec", () => {
         workspaceId: "ws1",
         repoUrl: "https://github.com/a/b",
         repoRef: "main",
+        model: "claude-sonnet-4-6[1m]",
       };
       expect(serialize(input)).toEqual(input);
     });
