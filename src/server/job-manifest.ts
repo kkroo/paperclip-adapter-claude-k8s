@@ -279,6 +279,18 @@ function shortHash(input: string, len = 6): string {
   return createHash("sha256").update(input).digest("hex").slice(0, len);
 }
 
+/**
+ * "x-penstock-session: agent:<name>" header line for ANTHROPIC_CUSTOM_HEADERS.
+ * Name falls back to the agent id; CR/LF stripped (header injection) and
+ * length-bounded, mirroring the opencode_k8s adapter's stamp.
+ */
+function penstockSessionHeaderLine(agent: { id?: string; name?: string | null }): string | null {
+  const name = String(agent?.name ?? "").replace(/[\r\n]/g, "").trim();
+  const id = String(agent?.id ?? "").replace(/[\r\n]/g, "").trim();
+  const label = (name || id).slice(0, 128);
+  return label ? `x-penstock-session: agent:${label}` : null;
+}
+
 function buildEnvVars(
   ctx: AdapterExecutionContext,
   selfPod: SelfPodInfo,
@@ -366,6 +378,26 @@ function buildEnvVars(
   const userEnvKeys = new Set(Object.keys(envConfig));
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") merged[key] = value;
+  }
+
+  // Per-agent Penstock session identity (org_penstock #accounts attribution).
+  // Every agent Job shares the one org API key, so without a per-agent
+  // client-session header the whole fleet melts into a single UNTAGGED bucket
+  // on the consumption dashboard. Claude Code forwards ANTHROPIC_CUSTOM_HEADERS
+  // ("Name: value" lines) on every API request, and Penstock's client-session
+  // extraction gives x-penstock-session top precedence. Merged AFTER the user
+  // env layer and skipped when an x-penstock-session line is already present,
+  // so a manual override always wins (same semantics as the host's
+  // claude_local X-Anthropic-Agent-Id stamp).
+  const sessionHeaderLine = penstockSessionHeaderLine(agent);
+  if (sessionHeaderLine) {
+    const existingHeaders =
+      typeof merged.ANTHROPIC_CUSTOM_HEADERS === "string" ? merged.ANTHROPIC_CUSTOM_HEADERS : "";
+    if (!/(^|\n)\s*x-penstock-session\s*:/i.test(existingHeaders)) {
+      merged.ANTHROPIC_CUSTOM_HEADERS = existingHeaders
+        ? `${existingHeaders}\n${sessionHeaderLine}`
+        : sessionHeaderLine;
+    }
   }
 
   // HOME must live on the mounted data PVC to enable session resume. Isolated
