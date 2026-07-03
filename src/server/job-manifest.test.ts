@@ -579,6 +579,39 @@ describe("buildJobManifest", () => {
       expect(apiKeyEntry?.value).toBeUndefined();
     });
 
+    it("stamps x-penstock-session: agent:<name> into ANTHROPIC_CUSTOM_HEADERS", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const envList = job.spec?.template?.spec?.containers[0]?.env ?? [];
+      const headers = envList.find((e) => e.name === "ANTHROPIC_CUSTOM_HEADERS");
+      expect(headers?.value).toContain("x-penstock-session: agent:");
+    });
+
+    it("appends the session header to an existing ANTHROPIC_CUSTOM_HEADERS and respects a manual override", () => {
+      const withExisting = {
+        ...ctx,
+        config: { ...(ctx.config as Record<string, unknown>), env: { ANTHROPIC_CUSTOM_HEADERS: "X-Custom: 1" } },
+      };
+      const r1 = buildJobManifest({ ctx: withExisting, selfPod });
+      const h1 = (r1.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
+        (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
+      );
+      expect(h1?.value).toContain("X-Custom: 1");
+      expect(h1?.value).toContain("x-penstock-session: agent:");
+
+      const withOverride = {
+        ...ctx,
+        config: {
+          ...(ctx.config as Record<string, unknown>),
+          env: { ANTHROPIC_CUSTOM_HEADERS: "x-penstock-session: manual-pin" },
+        },
+      };
+      const r2 = buildJobManifest({ ctx: withOverride, selfPod });
+      const h2 = (r2.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
+        (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
+      );
+      expect(h2?.value).toBe("x-penstock-session: manual-pin");
+    });
+
     it("literal env overrides valueFrom with the same name", () => {
       selfPod.inheritedEnv = { MY_VAR: "literal-value" };
       selfPod.inheritedEnvValueFrom = [
