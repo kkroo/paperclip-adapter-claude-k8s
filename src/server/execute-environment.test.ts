@@ -99,6 +99,7 @@ function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecu
     config: {},
     context: {},
     onLog: vi.fn().mockResolvedValue(undefined),
+    onExternalRuntimeLaunched: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   } as unknown as AdapterExecutionContext;
 }
