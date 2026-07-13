@@ -283,18 +283,14 @@ describe("buildJobManifest", () => {
       expect(job.spec?.template?.spec?.restartPolicy).toBe("Never");
     });
 
-    it("sets fsGroupChangePolicy to OnRootMismatch", () => {
-      const { job } = buildJobManifest({ ctx, selfPod });
-      expect(job.spec?.template?.spec?.securityContext?.fsGroupChangePolicy).toBe("OnRootMismatch");
-    });
-
-    it("sets fsGroup, runAsNonRoot, runAsUser, runAsGroup", () => {
+    it("sets the non-root uid and primary gid without requesting volume ownership changes", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const sc = job.spec?.template?.spec?.securityContext;
       expect(sc?.runAsNonRoot).toBe(true);
       expect(sc?.runAsUser).toBe(1000);
       expect(sc?.runAsGroup).toBe(1000);
-      expect(sc?.fsGroup).toBe(1000);
+      expect(sc?.fsGroup).toBeUndefined();
+      expect(sc?.fsGroupChangePolicy).toBeUndefined();
     });
 
     it("includes imagePullSecrets from selfPod", () => {
@@ -451,6 +447,9 @@ describe("buildJobManifest", () => {
       expect(dataVol?.persistentVolumeClaim?.claimName).toBe("paperclip-data");
       const dataMount = job.spec?.template?.spec?.containers[0]?.volumeMounts?.find((vm) => vm.mountPath === "/paperclip");
       expect(dataMount?.name).toBe("data");
+      const securityContext = job.spec?.template?.spec?.securityContext;
+      expect(securityContext?.fsGroup).toBeUndefined();
+      expect(securityContext?.fsGroupChangePolicy).toBeUndefined();
     });
 
     it("omits data volume when no PVC", () => {

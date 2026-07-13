@@ -473,10 +473,8 @@ function buildDindSidecar(opts: {
     imagePullPolicy: "IfNotPresent",
     // `--group=1000` makes dockerd create /var/run/docker.sock with group 1000
     // (mode 0660 root:1000). The main agent container runs as uid 1000 with
-    // podSecurityContext.fsGroup=1000, so without this it can't connect to the
-    // socket (dockerd otherwise creates it root:root mode 0660). Pairs with
-    // the pod-level runAsGroup=1000 / fsGroup=1000 this adapter already sets.
-    // BLO-5492.
+    // the pod's primary runAsGroup=1000, so without this it can't connect to
+    // the socket (dockerd otherwise creates it root:root mode 0660). BLO-5492.
     args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2", "--group=1000"],
     securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
     env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
@@ -772,8 +770,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     runAsNonRoot: true,
     runAsUser: 1000,
     runAsGroup: 1000,
-    fsGroup: 1000,
-    fsGroupChangePolicy: "OnRootMismatch",
   };
 
   // Build the claude command string for the main container
