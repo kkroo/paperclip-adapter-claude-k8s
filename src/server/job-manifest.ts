@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
+import { buildEnvGuardSetupShell } from "./env-guard.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -843,7 +844,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
-  const claudeInvocation = `set -o pipefail; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

@@ -1049,8 +1049,11 @@ describe("buildJobManifest", () => {
       // raced with another concurrent Job's `next` mid-write — see
       // ccrotateRefresh comment). Then `cat ... | claude ... | tee ... |
       // <fail-fast awk> > /dev/null` so a terminal rate-limit event
-      // unwinds the pipeline non-zero (RCA 2026-05-06).
-      expect(cmd?.[2]).toMatch(/^set -o pipefail; \(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee .* \| awk .* > \/dev\/null$/);
+      // unwinds the pipeline non-zero (RCA 2026-05-06). The PEN-1305 env-guard
+      // setup is installed first (after `set -o pipefail`, before the ccrotate
+      // preflight) so the PreToolUse hook is in place before Claude launches.
+      expect(cmd?.[2]).toMatch(/^set -o pipefail; .*paperclip-env-guard\.mjs.*\(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee .* \| awk .* > \/dev\/null$/);
+      expect((cmd?.[2] ?? "").indexOf("paperclip-env-guard.mjs")).toBeLessThan((cmd?.[2] ?? "").indexOf("ccrotate next"));
       expect(cmd?.[2]).not.toContain("ccrotate snap");
       expect(cmd?.[2]).not.toContain("rtk-filter");
     });
