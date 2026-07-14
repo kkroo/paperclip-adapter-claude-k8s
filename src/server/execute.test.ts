@@ -474,6 +474,30 @@ function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecu
   } as unknown as AdapterExecutionContext;
 }
 
+function makeIsolatedRuntime(isolationKey: string): AdapterExecutionContext["runtime"] {
+  return {
+    sessionId: null,
+    sessionParams: null,
+    sessionDisplayId: null,
+    taskKey: null,
+    isolation: {
+      isolationMode: "workspace",
+      isolationKey,
+      workspaceRoot: "/paperclip/workspaces/workspace-1",
+      homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
+      sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
+      cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+      storage: {
+        workspace: "persistent",
+        home: "persistent",
+        session: "persistent",
+        cache: "ephemeral",
+      },
+      sessionScope: { taskKey: "task-current", isolationKey },
+    } as NonNullable<AdapterExecutionContext["runtime"]["isolation"]>,
+  };
+}
+
 function makeSelfPodResult() {
   return {
     namespace: "paperclip",
@@ -632,10 +656,16 @@ describe("execute: concurrency guard", () => {
       json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
     }));
 
-    const result = await execute(makeCtx({ config: { isolationMode: "isolated", isolationKey: "current-key" } }));
+    const result = await execute(makeCtx({
+      config: { isolationMode: "isolated", isolationKey: "ignored-config-key" },
+      runtime: makeIsolatedRuntime("current-key"),
+    }));
 
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(result.errorMessage).toContain("create reached");
+    expect(mockPrepareBundle).toHaveBeenCalledWith(expect.objectContaining({
+      rootDir: expect.stringContaining("current-key/prompt-cache"),
+    }));
   });
 
   it("blocks active jobs with the same isolation key", async () => {
@@ -648,7 +678,7 @@ describe("execute: concurrency guard", () => {
       json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
     }));
 
-    const result = await execute(makeCtx({ config: { isolationMode: "isolated", isolationKey: "same-key" } }));
+    const result = await execute(makeCtx({ runtime: makeIsolatedRuntime("same-key") }));
 
     expect(mockBatchCreateJob).not.toHaveBeenCalled();
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");

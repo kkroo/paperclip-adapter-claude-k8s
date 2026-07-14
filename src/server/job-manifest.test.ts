@@ -35,6 +35,22 @@ function makeSelfPod(overrides: Partial<SelfPodInfo> = {}): SelfPodInfo {
   };
 }
 
+function setRuntimeIsolation(ctx: AdapterExecutionContext, isolation: Record<string, unknown>) {
+  ctx.runtime = {
+    ...ctx.runtime,
+    isolation: isolation as NonNullable<AdapterExecutionContext["runtime"]["isolation"]>,
+  };
+}
+
+function isolatedStorage(workspace: "ephemeral" | "persistent" = "persistent") {
+  return {
+    workspace,
+    home: workspace,
+    session: workspace,
+    cache: "ephemeral",
+  };
+}
+
 function encodeClaudeCwd(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9-]/g, "-");
 }
@@ -187,6 +203,22 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("isolated");
       expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBe("pr-review-123");
+    });
+
+    it("labels runtime isolation with its typed mode", () => {
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("run");
+      expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBe("runrun-abc12345");
     });
 
     it("reads sessionId from runtime.sessionParams when sessionId prop missing", () => {
@@ -492,6 +524,72 @@ describe("buildJobManifest", () => {
       expect(env.get("XDG_CACHE_HOME")).toBe(`${root}/cache/xdg`);
       expect(env.get("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("pr-review-123");
       expect(podLogPath).toBe("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123/run-abc12345.pod.ndjson");
+    });
+
+    it("prefers run-scoped runtime roots over manual config and clones an independent workspace", () => {
+      ctx.config = {
+        isolationMode: "isolated",
+        isolationKey: "config-key",
+        workspaceRoot: "/paperclip/config-workspace",
+      };
+      ctx.context = { paperclipWorkspace: { cwd: "/paperclip/source-worktree" } };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const container = job.spec?.template?.spec?.containers[0];
+      const env = new Map(container?.env?.map((entry) => [entry.name, entry.value]));
+      const command = container?.command?.join(" ") ?? "";
+      expect(container?.workingDir).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
+      expect(env.get("HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/home");
+      expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/runtime-cache/paperclip-runs/run-abc12345/session/.claude");
+      expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/cache/xdg");
+      expect(env.get("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
+      expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      expect(command).toContain("checkout --detach \"$source_head\"");
+      expect(command).not.toContain("/paperclip/config-workspace");
+    });
+
+    it("keeps durable workspace sessions persistent while caches remain ephemeral", () => {
+      ctx.context = { paperclipWorkspace: { cwd: "/paperclip/workspaces/workspace-1" } };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "workspace",
+        isolationKey: "workspace:workspace-1",
+        workspaceRoot: "/paperclip/workspaces/workspace-1",
+        homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
+        sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
+        cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+        storage: isolatedStorage(),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const container = job.spec?.template?.spec?.containers[0];
+      const env = new Map(container?.env?.map((entry) => [entry.name, entry.value]));
+      expect(container?.workingDir).toBe("/paperclip/workspaces/workspace-1");
+      expect(env.get("HOME")).toBe("/paperclip/k8s-isolation/workspace-1/home");
+      expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/paperclip/k8s-isolation/workspace-1/session/.claude");
+      expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
+      expect(container?.command?.join(" ")).not.toContain("git clone --shared");
+    });
+
+    it("lets a runtime shared descriptor override legacy isolated config", () => {
+      ctx.config = { isolationMode: "isolated", isolationKey: "config-key" };
+      ctx.context = { paperclipWorkspace: { cwd: "/paperclip/shared-workspace" } };
+      setRuntimeIsolation(ctx, { isolationMode: "shared" });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const container = job.spec?.template?.spec?.containers[0];
+      const env = new Map(container?.env?.map((entry) => [entry.name, entry.value]));
+      expect(container?.workingDir).toBe("/paperclip/shared-workspace");
+      expect(env.get("HOME")).toBe("/paperclip");
+      expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBeUndefined();
     });
 
     it("defaults build and package caches to runtime-cache emptyDir", () => {

@@ -19,7 +19,13 @@ import {
   isClaudeTransientUpstreamError,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
-import { buildJobManifest, buildPodLogPath, sanitizeLabelValue } from "./job-manifest.js";
+import {
+  buildJobManifest,
+  buildPodLogPath,
+  resolveJobIsolation,
+  sanitizeLabelValue,
+  type JobIsolation,
+} from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
@@ -81,15 +87,17 @@ const activeJobs = new Set<ActiveJobRef>();
 const agentCreationMutex = new Map<string, Promise<void>>();
 let sigtermHandlerRegistered = false;
 
-function resolveIsolationMutexKey(config: Record<string, unknown>, agentId: string): { mutexKey: string; isolationKey: string | null } {
-  const mode = asString(config.isolationMode, "shared").trim().toLowerCase();
-  const enabled = mode === "isolated" || mode === "isolate";
-  if (!enabled) return { mutexKey: agentId, isolationKey: null };
-  const rawKey = asString(config.isolationKey, "").trim();
-  if (!rawKey) throw new Error("isolationMode=isolated requires isolationKey");
-  const isolationKey = sanitizePathComponent(rawKey);
-  if (!isolationKey) throw new Error(`Isolation key "${rawKey}" cannot be sanitized to a valid Kubernetes label`);
-  return { mutexKey: `${agentId}:${isolationKey}`, isolationKey };
+function resolveIsolationMutexKey(
+  ctx: Pick<AdapterExecutionContext, "runtime" | "agent">,
+  config: Record<string, unknown>,
+): { mutexKey: string; isolationKey: string | null; isolation: JobIsolation } {
+  const isolation = resolveJobIsolation(ctx, config);
+  if (!isolation.enabled) return { mutexKey: ctx.agent.id, isolationKey: null, isolation };
+  return {
+    mutexKey: `${ctx.agent.id}:${isolation.key}`,
+    isolationKey: isolation.key,
+    isolation,
+  };
 }
 
 function sanitizePathComponent(value: string): string {
@@ -100,11 +108,16 @@ function safePathComponent(value: string): string {
   return sanitizePathComponent(value) || "unknown";
 }
 
-function resolvePromptCacheRoot(config: Record<string, unknown>, ctx: AdapterExecutionContext, isolationKey: string | null): string | null {
+function resolvePromptCacheRoot(
+  config: Record<string, unknown>,
+  ctx: AdapterExecutionContext,
+  isolation: JobIsolation,
+): string | null {
   const configured = asString(config.promptCacheRoot, "").trim();
   if (configured) return configured;
-  if (!isolationKey) return null;
-  const root = asString(config.isolationRoot, "").trim() || `/paperclip/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolationKey}`;
+  if (!isolation.enabled) return null;
+  if (isolation.promptCacheRoot) return isolation.promptCacheRoot;
+  const root = `/paperclip/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
   return `${root}/prompt-cache`;
 }
 
@@ -931,10 +944,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
   let isolationKey: string | null = null;
+  let jobIsolation!: JobIsolation;
   let creationMutexKey = "";
   try {
-    const isolation = resolveIsolationMutexKey(config, ctx.agent.id);
+    const isolation = resolveIsolationMutexKey(effectiveCtx, config);
     isolationKey = isolation.isolationKey;
+    jobIsolation = isolation.isolation;
     creationMutexKey = isolation.mutexKey;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1139,7 +1154,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     companyId: ctx.agent.companyId,
     skills: desiredSkills,
     instructionsContents,
-    rootDir: resolvePromptCacheRoot(config, ctx, isolationKey),
+    rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
     onLog,
   });
 
