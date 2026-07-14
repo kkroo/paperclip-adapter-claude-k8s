@@ -517,6 +517,7 @@ describe("buildJobManifest", () => {
       const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
       const container = job.spec?.template?.spec?.containers[0];
       const env = new Map(container?.env?.map((e) => [e.name, e.value]));
+      const command = container?.command?.join(" ") ?? "";
       const root = "/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/pr-review-123";
       expect(container?.workingDir).toBe(`${root}/workspace`);
       expect(env.get("HOME")).toBe(`${root}/home`);
@@ -524,6 +525,9 @@ describe("buildJobManifest", () => {
       expect(env.get("XDG_CACHE_HOME")).toBe(`${root}/cache/xdg`);
       expect(env.get("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("pr-review-123");
       expect(podLogPath).toBe("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123/run-abc12345.pod.ndjson");
+      expect(command).toContain(
+        "mkdir -p '/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123'",
+      );
     });
 
     it("prefers run-scoped runtime roots over manual config and clones an independent workspace", () => {
@@ -552,8 +556,11 @@ describe("buildJobManifest", () => {
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/runtime-cache/paperclip-runs/run-abc12345/session/.claude");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/cache/xdg");
       expect(env.get("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
+      expect(command).toContain("if git -C '/paperclip/source-worktree' rev-parse --verify HEAD");
       expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("checkout --detach \"$source_head\"");
+      expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
       expect(command).not.toContain("/paperclip/config-workspace");
     });
 
@@ -1150,10 +1157,15 @@ describe("buildJobManifest", () => {
       // unwinds the pipeline non-zero (RCA 2026-05-06). The PEN-1305 env-guard
       // setup is installed first (after `set -o pipefail`, before the ccrotate
       // preflight) so the PreToolUse hook is in place before Claude launches.
-      expect(cmd?.[2]).toMatch(/^set -o pipefail; .*paperclip-env-guard\.mjs.*\(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true; cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee .* \| awk .* > \/dev\/null$/);
-      expect((cmd?.[2] ?? "").indexOf("paperclip-env-guard.mjs")).toBeLessThan((cmd?.[2] ?? "").indexOf("ccrotate next"));
-      expect(cmd?.[2]).not.toContain("ccrotate snap");
-      expect(cmd?.[2]).not.toContain("rtk-filter");
+      const command = cmd?.[2] ?? "";
+      expect(command).toMatch(/^set -o pipefail;/);
+      expect(command).toMatch(/\(command -v ccrotate .*ccrotate next --yes --target claude.*\) \|\| true/);
+      expect(command).toMatch(/cat \/tmp\/prompt\/prompt\.txt \| claude .* \| tee .* \| awk .* > \/dev\/null$/);
+      expect(command.indexOf("paperclip-env-guard.mjs")).toBeLessThan(command.indexOf("ccrotate next"));
+      expect(command.indexOf("ccrotate next")).toBeLessThan(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs"));
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeLessThan(command.indexOf("cat /tmp/prompt/prompt.txt"));
+      expect(command).not.toContain("ccrotate snap");
+      expect(command).not.toContain("rtk-filter");
     });
 
     it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {
@@ -1226,13 +1238,14 @@ describe("buildJobManifest", () => {
       );
     });
 
-    it("init container does not create log directory (server pre-creates it on shared PVC)", () => {
+    it("main container creates the pod log directory before tee", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
-      const initCmd = job.spec?.template?.spec?.initContainers?.[0]?.command;
-      // Narrow guard: the init must not pre-create the instances/run-logs tree
-      // (the server owns that on the shared PVC). Other targeted mkdirs — e.g.
-      // the Chrome BrowserMetrics redirect's `.config/google-chrome` — are fine.
-      expect(initCmd?.[2]).not.toContain("mkdir -p /paperclip/instances");
+      const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      const mkdir = "mkdir -p '/paperclip/instances/default/data/run-logs/co1/agent-abc'";
+      const tee = "tee '/paperclip/instances/default/data/run-logs/co1/agent-abc/run-abc12345.pod.ndjson'";
+      expect(command).toContain(mkdir);
+      expect(command).toContain(tee);
+      expect(command.indexOf(mkdir)).toBeLessThan(command.indexOf(tee));
     });
 
     it("sanitizes companyId with / to valid path component for log path", () => {
