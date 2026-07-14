@@ -469,6 +469,7 @@ function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecu
     config: {},
     context: {},
     onLog: vi.fn().mockResolvedValue(undefined),
+    onExternalRuntimeLaunched: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   } as unknown as AdapterExecutionContext;
 }
@@ -772,6 +773,26 @@ describe("execute: job creation", () => {
     const result = await execute(makeCtx());
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(result.errorMessage).toContain("quota exceeded");
+  });
+
+  it("acknowledges the created Job identity before continuing", async () => {
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+
+    await execute(makeCtx({ onExternalRuntimeLaunched } as Partial<AdapterExecutionContext>));
+
+    expect(onExternalRuntimeLaunched).toHaveBeenCalledWith({
+      jobName: expect.any(String),
+      jobUid: "job-uid-1",
+    });
+  });
+
+  it("deletes the Job when launch identity cannot be acknowledged", async () => {
+    const result = await execute(makeCtx({
+      onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation released")),
+    } as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+    expect(mockBatchDeleteJob).toHaveBeenCalled();
   });
 
   it("returns k8s_pod_schedule_failed when pod scheduling times out", async () => {
