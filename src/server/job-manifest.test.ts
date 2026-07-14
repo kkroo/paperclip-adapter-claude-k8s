@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -561,6 +562,9 @@ describe("buildJobManifest", () => {
       expect(command).toContain("checkout --detach \"$source_head\"");
       expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
       expect(command).not.toContain("/paperclip/config-workspace");
     });
 

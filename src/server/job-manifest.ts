@@ -957,18 +957,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
-        [
+        `${[
           `source_head=$(git -C ${quoteShellArg(workspaceCwd)} rev-parse HEAD)`,
           `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
           // Git objects are immutable/content-addressed and may be shared read-only;
           // the clone still owns its refs, index, worktree, and lock files.
           `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
           `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
-        ].join(" && "),
+        ].join(" && ")};`,
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a
         // clean private cwd; the review workflow clones its target repository.
-        `else rm -rf ${quoteShellArg(isolation.workspaceRoot)} && mkdir -p ${quoteShellArg(isolation.workspaceRoot)}`,
+        `else rm -rf ${quoteShellArg(isolation.workspaceRoot)} && mkdir -p ${quoteShellArg(isolation.workspaceRoot)};`,
         `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
       ].join(" ")
     : "";
