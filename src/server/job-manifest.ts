@@ -79,37 +79,142 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
 };
 
-type JobIsolation = {
+type IsolationStorage = "ephemeral" | "persistent";
+
+export type JobIsolation = {
   enabled: boolean;
+  mode: "shared" | "run" | "workspace";
+  source: "runtime" | "config" | "shared";
   key: string;
   root: string;
   homeRoot: string;
+  sessionRoot: string;
   workspaceRoot: string;
   cacheRoot: string;
   promptCacheRoot: string;
+  storage: {
+    workspace: IsolationStorage;
+    home: IsolationStorage;
+    session: IsolationStorage;
+    cache: IsolationStorage;
+  };
 };
 
-function resolveJobIsolation(config: Record<string, unknown>, agent: AdapterExecutionContext["agent"]): JobIsolation {
+const SHARED_JOB_ISOLATION: JobIsolation = {
+  enabled: false,
+  mode: "shared",
+  source: "shared",
+  key: "",
+  root: "",
+  homeRoot: "",
+  sessionRoot: "",
+  workspaceRoot: "",
+  cacheRoot: "",
+  promptCacheRoot: "",
+  storage: {
+    workspace: "persistent",
+    home: "persistent",
+    session: "persistent",
+    cache: "persistent",
+  },
+};
+
+function readRequiredDescriptorString(raw: Record<string, unknown>, field: string): string {
+  const value = asString(raw[field], "").trim();
+  if (!value) throw new Error(`runtime isolation descriptor requires ${field}`);
+  return value;
+}
+
+function readDescriptorStorage(raw: Record<string, unknown>, field: string): IsolationStorage {
+  const value = asString(raw[field], "").trim();
+  if (value !== "ephemeral" && value !== "persistent") {
+    throw new Error(`runtime isolation descriptor has invalid storage.${field}`);
+  }
+  return value;
+}
+
+export function resolveJobIsolation(
+  ctx: Pick<AdapterExecutionContext, "runtime" | "agent">,
+  config: Record<string, unknown>,
+): JobIsolation {
+  const runtimeIsolation = (ctx.runtime as unknown as { isolation?: unknown }).isolation;
+  if (runtimeIsolation !== null && runtimeIsolation !== undefined) {
+    if (typeof runtimeIsolation !== "object" || Array.isArray(runtimeIsolation)) {
+      throw new Error("runtime isolation descriptor must be an object");
+    }
+    const raw = runtimeIsolation as Record<string, unknown>;
+    const mode = asString(raw.isolationMode, "").trim();
+    if (mode === "shared") return { ...SHARED_JOB_ISOLATION, source: "runtime" };
+    if (mode !== "run" && mode !== "workspace") {
+      throw new Error(`runtime isolation descriptor has invalid isolationMode: ${mode || "<missing>"}`);
+    }
+    const rawKey = readRequiredDescriptorString(raw, "isolationKey");
+    const key = sanitizeForK8sPath(rawKey) || shortHash(rawKey);
+    assertSafePathComponent("isolationKey", key);
+    const storage = parseObject(raw.storage);
+    const workspaceRoot = readRequiredDescriptorString(raw, "workspaceRoot");
+    const homeRoot = readRequiredDescriptorString(raw, "homeRoot");
+    const sessionRoot = readRequiredDescriptorString(raw, "sessionRoot");
+    const cacheRoot = readRequiredDescriptorString(raw, "cacheRoot");
+    for (const [field, value] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot })) {
+      if (!path.posix.isAbsolute(value)) throw new Error(`runtime isolation descriptor ${field} must be absolute`);
+    }
+    return {
+      enabled: true,
+      mode,
+      source: "runtime",
+      key,
+      root: path.posix.dirname(homeRoot),
+      homeRoot,
+      sessionRoot,
+      workspaceRoot,
+      cacheRoot,
+      promptCacheRoot: "",
+      storage: {
+        workspace: readDescriptorStorage(storage, "workspace"),
+        home: readDescriptorStorage(storage, "home"),
+        session: readDescriptorStorage(storage, "session"),
+        cache: readDescriptorStorage(storage, "cache"),
+      },
+    };
+  }
+
   const mode = asString(config.isolationMode, "shared").trim().toLowerCase();
   const enabled = mode === "isolated" || mode === "isolate";
-  if (!enabled) {
-    return { enabled: false, key: "", root: "", homeRoot: "", workspaceRoot: "", cacheRoot: "", promptCacheRoot: "" };
-  }
+  if (!enabled) return SHARED_JOB_ISOLATION;
 
   const rawKey = asString(config.isolationKey, "").trim();
   if (!rawKey) throw new Error("isolationMode=isolated requires isolationKey");
   const key = sanitizeForK8sPath(rawKey) || shortHash(rawKey);
   assertSafePathComponent("isolationKey", key);
-  const companyId = sanitizeForK8sPath(agent.companyId);
-  const agentId = sanitizeForK8sPath(agent.id);
+  const companyId = sanitizeForK8sPath(ctx.agent.companyId);
+  const agentId = sanitizeForK8sPath(ctx.agent.id);
   assertSafePathComponent("companyId", companyId);
   assertSafePathComponent("agentId", agentId);
   const root = asString(config.isolationRoot, "").trim() || `/paperclip/instances/default/data/k8s-isolation/${companyId}/${agentId}/${key}`;
   const homeRoot = asString(config.homeRoot, "").trim() || `${root}/home`;
+  const sessionRoot = asString(config.sessionRoot, "").trim() || homeRoot;
   const workspaceRoot = asString(config.workspaceRoot, "").trim() || `${root}/workspace`;
   const cacheRoot = asString(config.cacheRoot, "").trim() || `${root}/cache`;
   const promptCacheRoot = asString(config.promptCacheRoot, "").trim() || `${root}/prompt-cache`;
-  return { enabled, key, root, homeRoot, workspaceRoot, cacheRoot, promptCacheRoot };
+  return {
+    enabled,
+    mode: "workspace",
+    source: "config",
+    key,
+    root,
+    homeRoot,
+    sessionRoot,
+    workspaceRoot,
+    cacheRoot,
+    promptCacheRoot,
+    storage: {
+      workspace: "persistent",
+      home: "persistent",
+      session: "persistent",
+      cache: "persistent",
+    },
+  };
 }
 
 function encodeClaudeCwd(cwd: string): string {
@@ -132,13 +237,14 @@ function resolveResumableClaudeSessionId(input: {
   workingDir: string;
   config: Record<string, unknown>;
   selfPod: SelfPodInfo;
+  claudeConfigDir?: string | null;
 }): string {
   const sessionId = input.requestedSessionId.trim();
   if (!sessionId) return "";
   const requestedModel = input.requestedModel.trim();
   if (requestedModel && input.sessionModel.trim() !== requestedModel) return "";
   const sessionFile = path.join(
-    resolveClaudeConfigDir(input.config, input.selfPod),
+    input.claudeConfigDir || resolveClaudeConfigDir(input.config, input.selfPod),
     "projects",
     encodeClaudeCwd(input.workingDir),
     `${sessionId}.jsonl`,
@@ -405,9 +511,11 @@ function buildEnvVars(
   // mode scopes Claude config/cache/session state away from shared /paperclip.
   merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
   if (isolation.enabled) {
-    merged.CLAUDE_CONFIG_DIR = `${isolation.homeRoot}/.claude`;
-    merged.XDG_CONFIG_HOME = `${isolation.homeRoot}/.config`;
+    merged.CLAUDE_CONFIG_DIR = `${isolation.sessionRoot}/.claude`;
+    merged.XDG_CONFIG_HOME = `${isolation.sessionRoot}/.config`;
     merged.PAPERCLIP_K8S_ISOLATION_KEY = isolation.key;
+    merged.PAPERCLIP_K8S_ISOLATION_MODE = isolation.mode;
+    merged.PAPERCLIP_WORKSPACE_CWD = isolation.workspaceRoot;
   }
   const cacheEnv = isolation.enabled
     ? {
@@ -528,7 +636,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configuredTolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
   const tolerations = hasConfigKey("tolerations") ? configuredTolerations : selfPod.tolerations;
   const extraLabels = parseKeyValueConfig(config.labels);
-  const isolation = resolveJobIsolation(config, agent);
+  const isolation = resolveJobIsolation(ctx, config);
 
   // Resolve working directory — use workspace cwd, fall back to /paperclip
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -560,6 +668,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     workingDir,
     config,
     selfPod,
+    claudeConfigDir: isolation.enabled ? `${isolation.sessionRoot}/.claude` : null,
   });
   const templateData = {
     agentId: agent.id,
@@ -689,7 +798,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const sessionLabel = runtimeSessionId ? sanitizeLabelValue(runtimeSessionId) : null;
   if (sessionLabel) labels["paperclip.io/session-id"] = sessionLabel;
   if (isolation.enabled) {
-    labels["paperclip.io/isolation-mode"] = "isolated";
+    labels["paperclip.io/isolation-mode"] = isolation.source === "config" ? "isolated" : isolation.mode;
     labels["paperclip.io/isolation-key"] = isolation.key;
   }
   for (const [key, value] of Object.entries(extraLabels)) {
@@ -844,7 +953,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
-  const claudeInvocation = `set -o pipefail; ${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
+  const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
+    ? [
+        `source_head=$(git -C ${quoteShellArg(workspaceCwd)} rev-parse HEAD)`,
+        `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
+        // Git objects are immutable/content-addressed and may be shared read-only;
+        // the clone still owns its refs, index, worktree, and lock files.
+        `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
+        `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
+        `cd ${quoteShellArg(isolation.workspaceRoot)}`,
+      ].join(" && ")
+    : "";
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup}; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -914,7 +1035,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const browserHome = isolation.enabled ? isolation.homeRoot : dataMountPath;
   const browserMetricsTarget = isolation.enabled ? `${isolation.cacheRoot}/chrome-browser-metrics` : `${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics`;
   initCommandParts.push(
-    ...(isolation.enabled ? [`mkdir -p ${isolation.homeRoot} ${isolation.workspaceRoot} ${isolation.cacheRoot} ${isolation.promptCacheRoot}`] : []),
+    ...(isolation.enabled
+      ? [`mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.workspaceRoot, isolation.cacheRoot, isolation.promptCacheRoot]
+          .filter(Boolean)
+          .map(quoteShellArg)
+          .join(" ")}`]
+      : []),
     `mkdir -p ${browserHome}/.config/google-chrome ${browserMetricsTarget}`,
     `[ -L ${browserHome}/.config/google-chrome/BrowserMetrics ] || { rm -rf ${browserHome}/.config/google-chrome/BrowserMetrics; ln -sfn ${browserMetricsTarget} ${browserHome}/.config/google-chrome/BrowserMetrics; }`,
   );
