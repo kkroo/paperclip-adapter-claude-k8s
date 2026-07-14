@@ -956,16 +956,24 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
-        `source_head=$(git -C ${quoteShellArg(workspaceCwd)} rev-parse HEAD)`,
-        `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
-        // Git objects are immutable/content-addressed and may be shared read-only;
-        // the clone still owns its refs, index, worktree, and lock files.
-        `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
-        `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
-        `cd ${quoteShellArg(isolation.workspaceRoot)}`,
-      ].join(" && ")
+        `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
+        [
+          `source_head=$(git -C ${quoteShellArg(workspaceCwd)} rev-parse HEAD)`,
+          `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
+          // Git objects are immutable/content-addressed and may be shared read-only;
+          // the clone still owns its refs, index, worktree, and lock files.
+          `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
+          `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
+        ].join(" && "),
+        // Stateless PR-review agents may start from the generic per-agent fallback
+        // directory, which is intentionally not a repository. Give those runs a
+        // clean private cwd; the review workflow clones its target repository.
+        `else rm -rf ${quoteShellArg(isolation.workspaceRoot)} && mkdir -p ${quoteShellArg(isolation.workspaceRoot)}`,
+        `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
+      ].join(" ")
     : "";
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup}; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${podLogPath} | ${failFastFilter} > /dev/null`;
+  const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; ${preparePodLog}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
