@@ -487,6 +487,7 @@ function makeIsolatedRuntime(isolationKey: string): AdapterExecutionContext["run
       homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
       sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
       cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+      tmpRoot: "/runtime-cache/paperclip-workspaces/workspace-1/tmp",
       storage: {
         workspace: "persistent",
         home: "persistent",

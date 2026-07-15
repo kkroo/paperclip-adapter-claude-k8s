@@ -214,6 +214,7 @@ describe("buildJobManifest", () => {
         homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
         sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
         cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
         storage: isolatedStorage("ephemeral"),
       });
 
@@ -524,6 +525,9 @@ describe("buildJobManifest", () => {
       expect(env.get("HOME")).toBe(`${root}/home`);
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe(`${root}/home/.claude`);
       expect(env.get("XDG_CACHE_HOME")).toBe(`${root}/cache/xdg`);
+      expect(env.get("TMPDIR")).toBe(`${root}/tmp`);
+      expect(env.get("TMP")).toBe(`${root}/tmp`);
+      expect(env.get("TEMP")).toBe(`${root}/tmp`);
       expect(env.get("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("pr-review-123");
       expect(podLogPath).toBe("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123/run-abc12345.pod.ndjson");
       expect(command).toContain(
@@ -545,6 +549,7 @@ describe("buildJobManifest", () => {
         homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
         sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
         cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
         storage: isolatedStorage("ephemeral"),
       });
 
@@ -556,6 +561,9 @@ describe("buildJobManifest", () => {
       expect(env.get("HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/home");
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/runtime-cache/paperclip-runs/run-abc12345/session/.claude");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/cache/xdg");
+      expect(env.get("TMPDIR")).toBe("/runtime-cache/paperclip-runs/run-abc12345/tmp");
+      expect(env.get("TMP")).toBe("/runtime-cache/paperclip-runs/run-abc12345/tmp");
+      expect(env.get("TEMP")).toBe("/runtime-cache/paperclip-runs/run-abc12345/tmp");
       expect(env.get("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
       expect(command).toContain("if git -C '/paperclip/source-worktree' rev-parse --verify HEAD");
       expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
@@ -568,6 +576,36 @@ describe("buildJobManifest", () => {
       expect(command).not.toContain("/paperclip/config-workspace");
     });
 
+    it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {
+      const buildForRun = (runId: string) => {
+        const runCtx = makeCtx({ runId });
+        setRuntimeIsolation(runCtx, {
+          isolationMode: "run",
+          isolationKey: `run:${runId}`,
+          workspaceRoot: `/runtime-cache/paperclip-runs/${runId}/workspace`,
+          homeRoot: `/runtime-cache/paperclip-runs/${runId}/home`,
+          sessionRoot: `/runtime-cache/paperclip-runs/${runId}/session`,
+          cacheRoot: `/runtime-cache/paperclip-runs/${runId}/cache`,
+          tmpRoot: `/runtime-cache/paperclip-runs/${runId}/tmp`,
+          storage: isolatedStorage("ephemeral"),
+        });
+        const { job } = buildJobManifest({ ctx: runCtx, selfPod });
+        const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
+        return { TMPDIR: env.get("TMPDIR"), TMP: env.get("TMP"), TEMP: env.get("TEMP") };
+      };
+
+      const first = buildForRun("run-11111111");
+      const second = buildForRun("run-22222222");
+
+      expect(first.TMPDIR).toBe("/runtime-cache/paperclip-runs/run-11111111/tmp");
+      expect(second.TMPDIR).toBe("/runtime-cache/paperclip-runs/run-22222222/tmp");
+      expect(first.TMPDIR).not.toBe(second.TMPDIR);
+      expect(first.TMP).toBe(first.TMPDIR);
+      expect(first.TEMP).toBe(first.TMPDIR);
+      expect(second.TMP).toBe(second.TMPDIR);
+      expect(second.TEMP).toBe(second.TMPDIR);
+    });
+
     it("keeps durable workspace sessions persistent while caches remain ephemeral", () => {
       ctx.context = { paperclipWorkspace: { cwd: "/paperclip/workspaces/workspace-1" } };
       setRuntimeIsolation(ctx, {
@@ -577,6 +615,7 @@ describe("buildJobManifest", () => {
         homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
         sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
         cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+        tmpRoot: "/runtime-cache/paperclip-workspaces/workspace-1/tmp",
         storage: isolatedStorage(),
       });
 
@@ -586,6 +625,7 @@ describe("buildJobManifest", () => {
       expect(container?.workingDir).toBe("/paperclip/workspaces/workspace-1");
       expect(env.get("HOME")).toBe("/paperclip/k8s-isolation/workspace-1/home");
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/paperclip/k8s-isolation/workspace-1/session/.claude");
+      expect(env.get("TMPDIR")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
       expect(container?.command?.join(" ")).not.toContain("git clone --shared");
     });
@@ -600,6 +640,7 @@ describe("buildJobManifest", () => {
       const env = new Map(container?.env?.map((entry) => [entry.name, entry.value]));
       expect(container?.workingDir).toBe("/paperclip/shared-workspace");
       expect(env.get("HOME")).toBe("/paperclip");
+      expect(env.get("TMPDIR")).toBeUndefined();
       expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBeUndefined();
     });
 

@@ -91,6 +91,7 @@ export type JobIsolation = {
   sessionRoot: string;
   workspaceRoot: string;
   cacheRoot: string;
+  tmpRoot: string;
   promptCacheRoot: string;
   storage: {
     workspace: IsolationStorage;
@@ -110,6 +111,7 @@ const SHARED_JOB_ISOLATION: JobIsolation = {
   sessionRoot: "",
   workspaceRoot: "",
   cacheRoot: "",
+  tmpRoot: "",
   promptCacheRoot: "",
   storage: {
     workspace: "persistent",
@@ -156,7 +158,8 @@ export function resolveJobIsolation(
     const homeRoot = readRequiredDescriptorString(raw, "homeRoot");
     const sessionRoot = readRequiredDescriptorString(raw, "sessionRoot");
     const cacheRoot = readRequiredDescriptorString(raw, "cacheRoot");
-    for (const [field, value] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot })) {
+    const tmpRoot = readRequiredDescriptorString(raw, "tmpRoot");
+    for (const [field, value] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot, tmpRoot })) {
       if (!path.posix.isAbsolute(value)) throw new Error(`runtime isolation descriptor ${field} must be absolute`);
     }
     return {
@@ -169,6 +172,7 @@ export function resolveJobIsolation(
       sessionRoot,
       workspaceRoot,
       cacheRoot,
+      tmpRoot,
       promptCacheRoot: "",
       storage: {
         workspace: readDescriptorStorage(storage, "workspace"),
@@ -196,6 +200,7 @@ export function resolveJobIsolation(
   const sessionRoot = asString(config.sessionRoot, "").trim() || homeRoot;
   const workspaceRoot = asString(config.workspaceRoot, "").trim() || `${root}/workspace`;
   const cacheRoot = asString(config.cacheRoot, "").trim() || `${root}/cache`;
+  const tmpRoot = asString(config.tmpRoot, "").trim() || `${root}/tmp`;
   const promptCacheRoot = asString(config.promptCacheRoot, "").trim() || `${root}/prompt-cache`;
   return {
     enabled,
@@ -207,6 +212,7 @@ export function resolveJobIsolation(
     sessionRoot,
     workspaceRoot,
     cacheRoot,
+    tmpRoot,
     promptCacheRoot,
     storage: {
       workspace: "persistent",
@@ -526,6 +532,12 @@ function buildEnvVars(
         BUN_INSTALL_CACHE: `${isolation.cacheRoot}/bun`,
         PIP_CACHE_DIR: `${isolation.cacheRoot}/pip`,
         PLAYWRIGHT_BROWSERS_PATH: `${isolation.cacheRoot}/ms-playwright`,
+        // Run-scoped so concurrent stateless Jobs never share a writable temp
+        // directory (BLO-16219) — previously unset here, defaulting to the
+        // image's shared /tmp and colliding across concurrent runs.
+        TMPDIR: isolation.tmpRoot,
+        TMP: isolation.tmpRoot,
+        TEMP: isolation.tmpRoot,
       }
     : RUNTIME_CACHE_ENV;
   for (const [key, value] of Object.entries(cacheEnv)) {
@@ -1044,7 +1056,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const browserMetricsTarget = isolation.enabled ? `${isolation.cacheRoot}/chrome-browser-metrics` : `${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics`;
   initCommandParts.push(
     ...(isolation.enabled
-      ? [`mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.workspaceRoot, isolation.cacheRoot, isolation.promptCacheRoot]
+      ? [`mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.workspaceRoot, isolation.cacheRoot, isolation.tmpRoot, isolation.promptCacheRoot]
           .filter(Boolean)
           .map(quoteShellArg)
           .join(" ")}`]
