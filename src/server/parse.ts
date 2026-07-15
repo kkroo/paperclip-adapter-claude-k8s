@@ -259,6 +259,57 @@ function buildClaudeTransientHaystack(input: {
     .join("\n");
 }
 
+function retryNotBeforeFromObject(value: Record<string, unknown>): string | null {
+  const raw = value.retryNotBefore ?? value.retry_not_before ?? value.resumeAt ?? value.resume_at;
+  if (typeof raw !== "string" && typeof raw !== "number") return null;
+  const timestamp = new Date(raw).getTime();
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+
+function parseEmbeddedJsonObject(text: string): Record<string, unknown> | null {
+  const direct = parseJson(text.trim());
+  if (direct) return direct;
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  return parseJson(text.slice(start, end + 1));
+}
+
+/**
+ * Extract an absolute retry timestamp from Claude's structured provider error.
+ * Claude Code embeds proxy JSON in the result string instead of exposing HTTP
+ * response headers, so parse that JSON rather than scraping the human message.
+ */
+export function extractClaudeRetryNotBefore(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string | null {
+  const parsed = input.parsed ?? null;
+  if (parsed) {
+    const direct = retryNotBeforeFromObject(parsed);
+    if (direct) return direct;
+  }
+
+  const texts = [
+    parsed ? asString(parsed.result, "") : "",
+    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
+    input.errorMessage ?? "",
+    input.stdout ?? "",
+    input.stderr ?? "",
+  ];
+  for (const text of texts) {
+    if (!text) continue;
+    const embedded = parseEmbeddedJsonObject(text);
+    if (!embedded) continue;
+    const retryNotBefore = retryNotBeforeFromObject(embedded);
+    if (retryNotBefore) return retryNotBefore;
+  }
+  return null;
+}
+
 export function isClaudeTransientUpstreamError(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;

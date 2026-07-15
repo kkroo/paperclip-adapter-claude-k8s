@@ -8,6 +8,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
   isClaudeTransientUpstreamError,
+  extractClaudeRetryNotBefore,
 } from "./parse.js";
 
 describe("parseClaudeStreamJson", () => {
@@ -316,6 +317,40 @@ describe("isClaudeTransientUpstreamError", () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+describe("extractClaudeRetryNotBefore", () => {
+  it("extracts Penstock resume_at from Claude's embedded provider JSON", () => {
+    expect(
+      extractClaudeRetryNotBefore({
+        parsed: {
+          type: "result",
+          is_error: true,
+          result:
+            "API Error: Request rejected (429) · {\"error\":\"capacity unavailable\",\"code\":\"capacity_retry_exhausted\",\"resume_at\":\"2026-07-15T01:59:59.952Z\"}",
+        },
+      }),
+    ).toBe("2026-07-15T01:59:59.952Z");
+  });
+
+  it("prefers an explicit structured retryNotBefore field", () => {
+    expect(
+      extractClaudeRetryNotBefore({
+        parsed: {
+          retryNotBefore: "2026-07-15T02:00:00Z",
+          result: "not structured",
+        },
+      }),
+    ).toBe("2026-07-15T02:00:00.000Z");
+  });
+
+  it("ignores malformed embedded response data", () => {
+    expect(
+      extractClaudeRetryNotBefore({
+        parsed: { result: "API Error: Request rejected (429) · {not-json}" },
+      }),
+    ).toBeNull();
   });
 });
 

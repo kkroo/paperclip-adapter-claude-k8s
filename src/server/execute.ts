@@ -17,6 +17,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
   isClaudeTransientUpstreamError,
+  extractClaudeRetryNotBefore,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
 import {
@@ -1751,8 +1752,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     stdout,
     errorMessage,
   });
+  const retryNotBefore = transientUpstream
+    ? extractClaudeRetryNotBefore({ parsed, stdout, errorMessage })
+    : null;
   const resultJson = transientUpstream
-    ? { ...parsed, errorFamily: "transient_upstream" }
+    ? {
+        ...parsed,
+        errorFamily: "transient_upstream",
+        ...(retryNotBefore ? { retryNotBefore } : {}),
+      }
     : parsed;
 
   return {
@@ -1762,6 +1770,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     errorMessage,
     errorCode: transientUpstream ? "claude_transient_upstream" : null,
     errorFamily: transientUpstream ? "transient_upstream" : null,
+    retryNotBefore,
     usage,
     sessionId: resolvedSessionId || null,
     sessionParams: resolvedSessionParams,
