@@ -983,6 +983,34 @@ describe("execute: job creation", () => {
     }
   });
 
+  it("does not fail an isolated run when telemetry logging and reporting fail", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("metrics route unavailable")));
+    mockCoreListPods.mockResolvedValue({ items: [] });
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+    const onLog = vi.fn().mockImplementation(async (_stream: string, message: string) => {
+      if (message.includes("k8s_isolated_run_started")) throw new Error("log transport unavailable");
+    });
+
+    try {
+      const result = await execute(makeCtx({
+        authToken: "run-token",
+        config: { podScheduleTimeoutSec: 0 },
+        runtime: makeIsolatedRuntime("current-key"),
+        onExternalRuntimeLaunched,
+        onLog,
+      } as Partial<AdapterExecutionContext>));
+
+      expect(onExternalRuntimeLaunched).toHaveBeenCalledOnce();
+      expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+      expect(result.errorMessage).not.toContain("metrics route unavailable");
+      expect(result.errorMessage).not.toContain("log transport unavailable");
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.PAPERCLIP_API_URL;
+    }
+  });
+
   it("deletes the Job when launch identity cannot be acknowledged", async () => {
     const result = await execute(makeCtx({
       onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation released")),

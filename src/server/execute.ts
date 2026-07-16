@@ -158,11 +158,18 @@ async function reportGuardEvent(
   const event = path === CONCURRENT_RUN_BLOCKED_PATH
     ? "k8s_concurrent_run_blocked"
     : "k8s_isolated_run_started";
-  await ctx.onLog("stdout", `[paperclip] ${event}: ${JSON.stringify(body)}\n`);
+  const logBestEffort = async (stream: "stdout" | "stderr", message: string) => {
+    try {
+      await ctx.onLog(stream, message);
+    } catch {
+      // Telemetry must never change the adapter's allow/block decision.
+    }
+  };
+  await logBestEffort("stdout", `[paperclip] ${event}: ${JSON.stringify(body)}\n`);
 
   const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
   if (!apiUrl || !ctx.authToken) {
-    await ctx.onLog(
+    await logBestEffort(
       "stderr",
       `[paperclip] Warning: cannot report ${event}; PAPERCLIP_API_URL or adapter auth token is missing\n`,
     );
@@ -181,11 +188,11 @@ async function reportGuardEvent(
       signal: AbortSignal.timeout(2_000),
     });
     if (!response.ok) {
-      await ctx.onLog("stderr", `[paperclip] Warning: ${event} report returned HTTP ${response.status}\n`);
+      await logBestEffort("stderr", `[paperclip] Warning: ${event} report returned HTTP ${response.status}\n`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await ctx.onLog("stderr", `[paperclip] Warning: failed to report ${event}: ${message}\n`);
+    await logBestEffort("stderr", `[paperclip] Warning: failed to report ${event}: ${message}\n`);
   }
 }
 
