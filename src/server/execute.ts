@@ -32,7 +32,30 @@ import type * as k8s from "@kubernetes/client-node";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
+const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
+const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
+const TASK_KEY_LABEL = "paperclip.io/task-key";
+const TASK_ID_LABEL = "paperclip.io/task-id";
+const SESSION_ID_LABEL = "paperclip.io/session-id";
+const CONCURRENT_RUN_BLOCKED_PATH = "/api/metrics/claude-k8s/concurrent-run-blocked";
+const ISOLATED_RUN_STARTED_PATH = "/api/metrics/claude-k8s/isolated-run-started";
 const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timeout", "timed_out"]);
+
+type IsolationMode = JobIsolation["mode"];
+
+type GuardIdentity = {
+  isolationMode: IsolationMode | null;
+  isolationKey: string | null;
+  taskKey: string | null;
+  sessionId: string | null;
+  validIsolationMetadata: boolean;
+};
+
+type ConcurrentRunBlockedReason =
+  | "live_job_for_active_run"
+  | "live_job_for_unknown_run"
+  | "shared_mode_serialized"
+  | "unknown_isolation_blocked";
 
 type HeartbeatRunSnapshot = {
   id: string;
@@ -71,6 +94,139 @@ async function fetchHeartbeatRunSnapshot(ctx: AdapterExecutionContext, runId: st
   if (resp.status === 404) return null;
   if (!resp.ok) throw new Error(`run lookup failed for ${runId}: HTTP ${resp.status}`);
   return readHeartbeatRunSnapshot(await resp.json());
+}
+
+function readOptionalString(value: unknown): string | null {
+  const parsed = asString(value, "").trim();
+  return parsed || null;
+}
+
+function readJobGuardIdentity(job: k8s.V1Job): GuardIdentity {
+  const labels = job.metadata?.labels ?? {};
+  const rawMode = readOptionalString(labels[ISOLATION_MODE_LABEL]);
+  const isolationMode = rawMode === "isolated"
+    ? "workspace"
+    : rawMode === "shared" || rawMode === "run" || rawMode === "workspace"
+      ? rawMode
+      : null;
+  const isolationKey = readOptionalString(labels[ISOLATION_KEY_LABEL]);
+
+  return {
+    isolationMode,
+    isolationKey,
+    taskKey: readOptionalString(labels[TASK_KEY_LABEL]) ?? readOptionalString(labels[TASK_ID_LABEL]),
+    sessionId: readOptionalString(labels[SESSION_ID_LABEL]),
+    validIsolationMetadata: isolationMode !== null && isolationKey !== null,
+  };
+}
+
+function readCurrentGuardIdentity(ctx: AdapterExecutionContext, isolation: JobIsolation): GuardIdentity {
+  const runtimeIsolation = parseObject(
+    (ctx.runtime as AdapterExecutionContext["runtime"] & { isolation?: unknown }).isolation,
+  );
+  const sessionScope = parseObject(runtimeIsolation.sessionScope);
+  const sessionParams = parseObject(ctx.runtime.sessionParams);
+  const isolationKey = readOptionalString(runtimeIsolation.isolationKey) ?? readOptionalString(isolation.key);
+
+  return {
+    isolationMode: isolation.mode,
+    isolationKey,
+    taskKey:
+      readOptionalString(sessionScope.taskKey)
+      ?? readOptionalString(ctx.runtime.taskKey)
+      ?? readOptionalString(ctx.context.taskId)
+      ?? readOptionalString(ctx.context.issueId),
+    sessionId: readOptionalString(sessionParams.sessionId) ?? readOptionalString(ctx.runtime.sessionId),
+    validIsolationMetadata: isolation.mode === "shared" || isolationKey !== null,
+  };
+}
+
+function classifyConcurrentBlock(
+  current: GuardIdentity,
+  conflicting: GuardIdentity,
+  conflictingRunId: string | null,
+): ConcurrentRunBlockedReason {
+  if (current.isolationMode === "shared") return "shared_mode_serialized";
+  if (!conflicting.validIsolationMetadata) return "unknown_isolation_blocked";
+  if (!conflictingRunId) return "live_job_for_unknown_run";
+  return "live_job_for_active_run";
+}
+
+async function reportGuardEvent(
+  ctx: AdapterExecutionContext,
+  path: typeof CONCURRENT_RUN_BLOCKED_PATH | typeof ISOLATED_RUN_STARTED_PATH,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const event = path === CONCURRENT_RUN_BLOCKED_PATH
+    ? "k8s_concurrent_run_blocked"
+    : "k8s_isolated_run_started";
+  const logBestEffort = async (stream: "stdout" | "stderr", message: string) => {
+    try {
+      await ctx.onLog(stream, message);
+    } catch {
+      // Telemetry must never change the adapter's allow/block decision.
+    }
+  };
+  await logBestEffort("stdout", `[paperclip] ${event}: ${JSON.stringify(body)}\n`);
+
+  const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
+  if (!apiUrl || !ctx.authToken) {
+    await logBestEffort(
+      "stderr",
+      `[paperclip] Warning: cannot report ${event}; PAPERCLIP_API_URL or adapter auth token is missing\n`,
+    );
+    return;
+  }
+
+  try {
+    const response = await fetch(`${apiUrl}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ctx.authToken}`,
+        "Content-Type": "application/json",
+        "X-Paperclip-Run-Id": ctx.runId,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) {
+      await logBestEffort("stderr", `[paperclip] Warning: ${event} report returned HTTP ${response.status}\n`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await logBestEffort("stderr", `[paperclip] Warning: failed to report ${event}: ${message}\n`);
+  }
+}
+
+async function reportConcurrentRunBlocked(
+  ctx: AdapterExecutionContext,
+  current: GuardIdentity,
+  conflicting: GuardIdentity,
+  conflictingRunId: string | null,
+): Promise<void> {
+  await reportGuardEvent(ctx, CONCURRENT_RUN_BLOCKED_PATH, {
+    agentId: ctx.agent.id,
+    companyId: ctx.agent.companyId,
+    reason: classifyConcurrentBlock(current, conflicting, conflictingRunId),
+    isolationMode: current.isolationMode ?? "shared",
+    isolationKey: conflicting.isolationKey ?? current.isolationKey,
+    taskKey: conflicting.taskKey ?? current.taskKey,
+    sessionId: conflicting.sessionId ?? current.sessionId,
+  });
+}
+
+async function reportIsolatedRunStarted(
+  ctx: AdapterExecutionContext,
+  current: GuardIdentity,
+): Promise<void> {
+  await reportGuardEvent(ctx, ISOLATED_RUN_STARTED_PATH, {
+    agentId: ctx.agent.id,
+    companyId: ctx.agent.companyId,
+    isolationMode: current.isolationMode,
+    isolationKey: current.isolationKey,
+    taskKey: current.taskKey,
+    sessionId: current.sessionId,
+  });
 }
 
 // Module-level tracking of active Jobs for SIGTERM best-effort cleanup.
@@ -963,6 +1119,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: "k8s_isolation_key_invalid",
     };
   }
+  const currentGuardIdentity = readCurrentGuardIdentity(effectiveCtx, jobIsolation);
   // K8sRemoteSpec.kubeconfig is *content* (resolved by the env driver), but
   // the adapter's existing config interprets `kubeconfig` as a filesystem
   // path. When the env supplies null we fall through to in-cluster auth as
@@ -1041,8 +1198,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const jobName = job.metadata?.name ?? "unknown";
         const jobNamespace = job.metadata?.namespace ?? guardNamespace;
 
+        const conflictingIdentity = readJobGuardIdentity(job);
+
         if (!jobRunId) {
           await onLog("stderr", `[paperclip] Blocked: running Job ${jobName} has no ${RUN_ID_LABEL} provenance label\n`);
+          await reportConcurrentRunBlocked(effectiveCtx, currentGuardIdentity, conflictingIdentity, null);
           return {
             exitCode: null,
             signal: null,
@@ -1064,9 +1224,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           continue;
         }
 
-        const jobIsolationKey = job.metadata?.labels?.["paperclip.io/isolation-key"] ?? null;
-        if (isolationKey && jobIsolationKey !== isolationKey) {
-          await onLog("stdout", `[paperclip] Allowing concurrent Job ${jobName}: isolation-key ${jobIsolationKey ?? "shared"} differs from ${isolationKey}.\n`);
+        if (
+          isolationKey
+          && conflictingIdentity.validIsolationMetadata
+          && conflictingIdentity.isolationMode !== "shared"
+          && conflictingIdentity.isolationKey !== isolationKey
+        ) {
+          await onLog("stdout", `[paperclip] Allowing concurrent Job ${jobName}: isolation-key ${conflictingIdentity.isolationKey} differs from ${isolationKey}.\n`);
           continue;
         }
 
@@ -1085,6 +1249,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (orphaned.length > 0) {
         const names = orphaned.map((j) => j.metadata?.name).join(", ");
         await onLog("stderr", `[paperclip] Concurrent run blocked: active run-backed Job(s) still running for this agent: ${names}\n`);
+        const conflictingJob = orphaned[0]!;
+        await reportConcurrentRunBlocked(
+          effectiveCtx,
+          currentGuardIdentity,
+          readJobGuardIdentity(conflictingJob),
+          readOptionalString(conflictingJob.metadata?.labels?.[RUN_ID_LABEL]),
+        );
         return {
           exitCode: null,
           signal: null,
@@ -1099,6 +1270,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (samRun.length > 0) {
         const names = samRun.map((j) => j.metadata?.name).join(", ");
         await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this run: ${names}\n`);
+        const conflictingJob = samRun[0]!;
+        await reportConcurrentRunBlocked(
+          effectiveCtx,
+          currentGuardIdentity,
+          readJobGuardIdentity(conflictingJob),
+          readOptionalString(conflictingJob.metadata?.labels?.[RUN_ID_LABEL]),
+        );
         return {
           exitCode: null,
           signal: null,
@@ -1283,6 +1461,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `External runtime launch acknowledgment failed: ${err instanceof Error ? err.message : String(err)}`,
         errorCode: "k8s_job_identity_unacknowledged",
       };
+    }
+
+    if (jobIsolation.enabled) {
+      await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
     }
 
     // Attach ownerReference so K8s GC cleans up the Secret if the process
