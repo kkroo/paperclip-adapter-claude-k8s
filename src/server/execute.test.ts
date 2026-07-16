@@ -71,6 +71,7 @@ function makeJob(opts: {
   agentId?: string;
   taskId?: string;
   sessionId?: string;
+  isolationMode?: "shared" | "run" | "workspace";
   isolationKey?: string;
   adapterType?: string;
   terminal?: boolean;
@@ -82,6 +83,7 @@ function makeJob(opts: {
   if (opts.runId) labels["paperclip.io/run-id"] = opts.runId;
   if (opts.taskId) labels["paperclip.io/task-id"] = opts.taskId;
   if (opts.sessionId) labels["paperclip.io/session-id"] = opts.sessionId;
+  if (opts.isolationMode) labels["paperclip.io/isolation-mode"] = opts.isolationMode;
   if (opts.isolationKey) labels["paperclip.io/isolation-key"] = opts.isolationKey;
   return {
     metadata: { name: "ac-job", namespace: "paperclip", labels },
@@ -647,7 +649,13 @@ describe("execute: concurrency guard", () => {
 
   it("allows active jobs with a different isolation key", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
-    const other = makeJob({ runId: "active-run", agentId: "agent-abc", taskId: "task-other", isolationKey: "other-key" });
+    const other = makeJob({
+      runId: "active-run",
+      agentId: "agent-abc",
+      taskId: "task-other",
+      isolationMode: "workspace",
+      isolationKey: "other-key",
+    });
     mockBatchListJobs.mockResolvedValue({ items: [other] });
     mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
     mockPrepareBundle.mockResolvedValue(makeBundle());
@@ -671,7 +679,13 @@ describe("execute: concurrency guard", () => {
 
   it("blocks active jobs with the same isolation key", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
-    const same = makeJob({ runId: "active-run", agentId: "agent-abc", taskId: "task-current", isolationKey: "same-key" });
+    const same = makeJob({
+      runId: "active-run",
+      agentId: "agent-abc",
+      taskId: "task-current",
+      isolationMode: "workspace",
+      isolationKey: "same-key",
+    });
     mockBatchListJobs.mockResolvedValue({ items: [same] });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
@@ -683,6 +697,119 @@ describe("execute: concurrency guard", () => {
 
     expect(mockBatchCreateJob).not.toHaveBeenCalled();
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+  });
+
+  it("reports the conflicting isolation key, task, and session for an isolated block", async () => {
+    const same = makeJob({
+      runId: "active-run",
+      agentId: "agent-abc",
+      taskId: "task-conflict",
+      sessionId: "session-conflict",
+      isolationMode: "workspace",
+      isolationKey: "same-key",
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [same] });
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { ok: true, status: 202 };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      authToken: "run-token",
+      runtime: makeIsolatedRuntime("same-key"),
+    }));
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    const reportCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/api/metrics/claude-k8s/concurrent-run-blocked")
+      && (init as RequestInit | undefined)?.method === "POST"
+    );
+    expect(reportCall).toBeDefined();
+    expect(JSON.parse((reportCall![1] as RequestInit).body as string)).toEqual({
+      agentId: "agent-abc",
+      companyId: "co1",
+      reason: "live_job_for_active_run",
+      isolationMode: "workspace",
+      isolationKey: "same-key",
+      taskKey: "task-conflict",
+      sessionId: "session-conflict",
+    });
+  });
+
+  it("fails closed and reports unknown isolation metadata for an unlabeled live Job", async () => {
+    const unlabeled = makeJob({
+      runId: "active-run",
+      agentId: "agent-abc",
+      taskId: "task-conflict",
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [unlabeled] });
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { ok: true, status: 202 };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      authToken: "run-token",
+      runtime: makeIsolatedRuntime("current-key"),
+    }));
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    const reportCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/api/metrics/claude-k8s/concurrent-run-blocked")
+      && (init as RequestInit | undefined)?.method === "POST"
+    );
+    expect(reportCall).toBeDefined();
+    expect(JSON.parse((reportCall![1] as RequestInit).body as string)).toMatchObject({
+      reason: "unknown_isolation_blocked",
+      isolationMode: "workspace",
+      isolationKey: "current-key",
+      taskKey: "task-conflict",
+    });
+  });
+
+  it("reports shared-mode serialization without changing the fail-closed result", async () => {
+    const active = makeJob({
+      runId: "active-run",
+      agentId: "agent-abc",
+      taskId: "task-conflict",
+      isolationMode: "shared",
+      isolationKey: "agent-sharedagent-abc",
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [active] });
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { ok: true, status: 202 };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({ authToken: "run-token" }));
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    const reportCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/api/metrics/claude-k8s/concurrent-run-blocked")
+      && (init as RequestInit | undefined)?.method === "POST"
+    );
+    expect(reportCall).toBeDefined();
+    expect(JSON.parse((reportCall![1] as RequestInit).body as string)).toMatchObject({
+      reason: "shared_mode_serialized",
+      isolationMode: "shared",
+      isolationKey: "agent-sharedagent-abc",
+      taskKey: "task-conflict",
+    });
   });
 
   it("still blocks unlabeled jobs as unknown orphans without consulting the run table", async () => {
@@ -815,6 +942,45 @@ describe("execute: job creation", () => {
       jobName: expect.any(String),
       jobUid: "job-uid-1",
     });
+  });
+
+  it("reports an isolated start after the Job identity is acknowledged", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 202 });
+    vi.stubGlobal("fetch", fetchMock);
+    mockCoreListPods.mockResolvedValue({ items: [] });
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+
+    try {
+      await execute(makeCtx({
+        authToken: "run-token",
+        config: { podScheduleTimeoutSec: 0 },
+        context: { taskId: "task-current" },
+        runtime: {
+          ...makeIsolatedRuntime("current-key"),
+          sessionId: "session-current",
+        },
+        onExternalRuntimeLaunched,
+      } as Partial<AdapterExecutionContext>));
+
+      expect(onExternalRuntimeLaunched).toHaveBeenCalledBefore(fetchMock);
+      const reportCall = fetchMock.mock.calls.find(([url, init]) =>
+        String(url).endsWith("/api/metrics/claude-k8s/isolated-run-started")
+        && (init as RequestInit | undefined)?.method === "POST"
+      );
+      expect(reportCall).toBeDefined();
+      expect(JSON.parse((reportCall![1] as RequestInit).body as string)).toEqual({
+        agentId: "agent-abc",
+        companyId: "co1",
+        isolationMode: "workspace",
+        isolationKey: "current-key",
+        taskKey: "task-current",
+        sessionId: "session-current",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.PAPERCLIP_API_URL;
+    }
   });
 
   it("deletes the Job when launch identity cannot be acknowledged", async () => {

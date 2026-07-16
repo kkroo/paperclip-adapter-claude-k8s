@@ -146,7 +146,12 @@ export function resolveJobIsolation(
     }
     const raw = runtimeIsolation as Record<string, unknown>;
     const mode = asString(raw.isolationMode, "").trim();
-    if (mode === "shared") return { ...SHARED_JOB_ISOLATION, source: "runtime" };
+    if (mode === "shared") {
+      const rawKey = readRequiredDescriptorString(raw, "isolationKey");
+      const key = sanitizeForK8sPath(rawKey) || shortHash(rawKey);
+      assertSafePathComponent("isolationKey", key);
+      return { ...SHARED_JOB_ISOLATION, source: "runtime", key };
+    }
     if (mode !== "run" && mode !== "workspace") {
       throw new Error(`runtime isolation descriptor has invalid isolationMode: ${mode || "<missing>"}`);
     }
@@ -809,7 +814,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (taskLabel) labels["paperclip.io/task-id"] = taskLabel;
   const sessionLabel = runtimeSessionId ? sanitizeLabelValue(runtimeSessionId) : null;
   if (sessionLabel) labels["paperclip.io/session-id"] = sessionLabel;
-  if (isolation.enabled) {
+  if (isolation.enabled || isolation.source === "runtime") {
     labels["paperclip.io/isolation-mode"] = isolation.source === "config" ? "isolated" : isolation.mode;
     labels["paperclip.io/isolation-key"] = isolation.key;
   }

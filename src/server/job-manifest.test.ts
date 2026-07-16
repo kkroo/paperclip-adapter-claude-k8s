@@ -633,7 +633,10 @@ describe("buildJobManifest", () => {
     it("lets a runtime shared descriptor override legacy isolated config", () => {
       ctx.config = { isolationMode: "isolated", isolationKey: "config-key" };
       ctx.context = { paperclipWorkspace: { cwd: "/paperclip/shared-workspace" } };
-      setRuntimeIsolation(ctx, { isolationMode: "shared" });
+      setRuntimeIsolation(ctx, {
+        isolationMode: "shared",
+        isolationKey: "agent-shared:agent-abc",
+      });
 
       const { job } = buildJobManifest({ ctx, selfPod });
       const container = job.spec?.template?.spec?.containers[0];
@@ -641,7 +644,8 @@ describe("buildJobManifest", () => {
       expect(container?.workingDir).toBe("/paperclip/shared-workspace");
       expect(env.get("HOME")).toBe("/paperclip");
       expect(env.get("TMPDIR")).toBeUndefined();
-      expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBeUndefined();
+      expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("shared");
+      expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBe("agent-sharedagent-abc");
     });
 
     it("defaults build and package caches to runtime-cache emptyDir", () => {
