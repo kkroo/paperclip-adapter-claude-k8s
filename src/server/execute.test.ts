@@ -71,7 +71,7 @@ function makeJob(opts: {
   agentId?: string;
   taskId?: string;
   sessionId?: string;
-  isolationMode?: "shared" | "run" | "workspace";
+  isolationMode?: "isolated" | "shared" | "run" | "workspace";
   isolationKey?: string;
   adapterType?: string;
   terminal?: boolean;
@@ -675,6 +675,29 @@ describe("execute: concurrency guard", () => {
     expect(mockPrepareBundle).toHaveBeenCalledWith(expect.objectContaining({
       rootDir: expect.stringContaining("current-key/prompt-cache"),
     }));
+  });
+
+  it("recognizes legacy isolated labels when allowing a different isolation key", async () => {
+    const other = makeJob({
+      runId: "active-run",
+      agentId: "agent-abc",
+      taskId: "task-other",
+      isolationMode: "isolated",
+      isolationKey: "legacy-other-key",
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [other] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "active-run", status: "running", startedAt: new Date().toISOString() }),
+    }));
+
+    const result = await execute(makeCtx({ runtime: makeIsolatedRuntime("current-key") }));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("create reached");
   });
 
   it("blocks active jobs with the same isolation key", async () => {

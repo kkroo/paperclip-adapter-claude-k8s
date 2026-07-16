@@ -202,7 +202,7 @@ describe("buildJobManifest", () => {
     it("adds isolation labels in isolated mode", () => {
       ctx.config = { isolationMode: "isolated", isolationKey: "pr-review-123" };
       const { job } = buildJobManifest({ ctx, selfPod });
-      expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("isolated");
+      expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("workspace");
       expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBe("pr-review-123");
     });
 

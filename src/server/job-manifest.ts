@@ -815,7 +815,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const sessionLabel = runtimeSessionId ? sanitizeLabelValue(runtimeSessionId) : null;
   if (sessionLabel) labels["paperclip.io/session-id"] = sessionLabel;
   if (isolation.enabled || isolation.source === "runtime") {
-    labels["paperclip.io/isolation-mode"] = isolation.source === "config" ? "isolated" : isolation.mode;
+    labels["paperclip.io/isolation-mode"] = isolation.mode;
     labels["paperclip.io/isolation-key"] = isolation.key;
   }
   for (const [key, value] of Object.entries(extraLabels)) {

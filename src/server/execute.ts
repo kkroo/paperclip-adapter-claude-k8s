@@ -104,9 +104,11 @@ function readOptionalString(value: unknown): string | null {
 function readJobGuardIdentity(job: k8s.V1Job): GuardIdentity {
   const labels = job.metadata?.labels ?? {};
   const rawMode = readOptionalString(labels[ISOLATION_MODE_LABEL]);
-  const isolationMode = rawMode === "shared" || rawMode === "run" || rawMode === "workspace"
-    ? rawMode
-    : null;
+  const isolationMode = rawMode === "isolated"
+    ? "workspace"
+    : rawMode === "shared" || rawMode === "run" || rawMode === "workspace"
+      ? rawMode
+      : null;
   const isolationKey = readOptionalString(labels[ISOLATION_KEY_LABEL]);
 
   return {
