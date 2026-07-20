@@ -31,6 +31,7 @@ import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
 const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
 const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
@@ -40,6 +41,22 @@ const SESSION_ID_LABEL = "paperclip.io/session-id";
 const CONCURRENT_RUN_BLOCKED_PATH = "/api/metrics/claude-k8s/concurrent-run-blocked";
 const ISOLATED_RUN_STARTED_PATH = "/api/metrics/claude-k8s/isolated-run-started";
 const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timeout", "timed_out"]);
+
+async function withK8sConcurrencyGuardTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(
+        `Kubernetes Job concurrency guard timed out after ${K8S_CONCURRENCY_GUARD_TIMEOUT_MS / 1000}s`,
+      ));
+    }, K8S_CONCURRENCY_GUARD_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 type IsolationMode = JobIsolation["mode"];
 
@@ -1182,10 +1199,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
   try {
-    const existing = await batchApi.listNamespacedJob({
-      namespace: guardNamespace,
-      labelSelector: `paperclip.io/agent-id=${sanitizedAgentId},paperclip.io/adapter-type=claude_k8s`,
-    });
+    const existing = await withK8sConcurrencyGuardTimeout(
+      batchApi.listNamespacedJob({
+        namespace: guardNamespace,
+        labelSelector: `paperclip.io/agent-id=${sanitizedAgentId},paperclip.io/adapter-type=claude_k8s`,
+      }),
+    );
     const running = existing.items.filter(
       (j) =>
         !j.metadata?.deletionTimestamp &&
