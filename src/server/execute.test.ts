@@ -575,6 +575,23 @@ describe("execute: concurrency guard", () => {
     expect(result.errorMessage).toContain("K8s API unavailable");
   });
 
+  it("fails closed when listNamespacedJob never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      mockBatchListJobs.mockImplementation(() => new Promise(() => {}));
+      const resultPromise = execute(makeCtx());
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      const result = await resultPromise;
+
+      expect(result.errorCode).toBe("k8s_concurrency_guard_unreachable");
+      expect(result.errorMessage).toContain("timed out after 15s");
+      expect(mockBatchCreateJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns k8s_concurrent_run_blocked when reattach disabled and orphan is running", async () => {
     const orphan = makeJob({ runId: "prior-run", agentId: "agent-abc", terminal: false });
     mockBatchListJobs.mockResolvedValue({ items: [orphan] });
