@@ -16,7 +16,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
-  isClaudeTransientUpstreamError,
+  classifyClaudeUpstreamFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
@@ -1945,21 +1945,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
   const failed = (exitCode ?? 0) !== 0;
-  const errorMessage = failed
+  const baseErrorMessage = failed
     ? describeClaudeFailure(parsed) ?? `Claude exited with code ${exitCode ?? -1}`
     : null;
-  const transientUpstream = failed && isClaudeTransientUpstreamError({
+  // "Before any token usage": the run consumed no input/cached/output tokens.
+  const zeroTokenProgress =
+    usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
+  const upstream = classifyClaudeUpstreamFailure({
+    failed,
+    zeroTokenProgress,
     parsed,
     stdout,
-    errorMessage,
+    errorMessage: baseErrorMessage,
   });
-  const retryNotBefore = transientUpstream
-    ? extractClaudeRetryNotBefore({ parsed, stdout, errorMessage })
+  const capacityExhausted = upstream.family === "upstream_capacity_exhausted";
+  const transientUpstream = upstream.family === "transient_upstream";
+  const requestedModel =
+    parsedStream.model || asString(parsed.model as string, "") || model || "(unknown)";
+  // A no-capacity tier fails identically forever, so surface it clearly instead
+  // of reporting `transient_upstream` (which feeds core's tight-reschedule loop).
+  // Retries then come at the agent's normal heartbeat cadence — paced + visible.
+  const errorMessage = capacityExhausted
+    ? `Provider capacity exhausted for model "${requestedModel}" before any token usage (penstock: ${upstream.capacityCode}); all subscriptions for this tier are exhausted, so the run made no progress. Not retried as a transient throttle — add capacity for this model to the vault pool or reassign the agent to a healthy tier.`
+    : baseErrorMessage;
+  // retryNotBefore stays informative for both throttle families (a capacity 429
+  // carries a Retry-After); on its own it does not re-arm the transient loop.
+  const retryNotBefore = (transientUpstream || capacityExhausted)
+    ? extractClaudeRetryNotBefore({ parsed, stdout, errorMessage: baseErrorMessage })
     : null;
-  const resultJson = transientUpstream
+  const resultJson = upstream.family
     ? {
         ...parsed,
-        errorFamily: "transient_upstream",
+        errorFamily: upstream.family,
+        ...(upstream.capacityCode ? { upstreamCapacityCode: upstream.capacityCode } : {}),
         ...(retryNotBefore ? { retryNotBefore } : {}),
       }
     : parsed;
@@ -1969,8 +1987,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: null,
     timedOut: false,
     errorMessage,
-    errorCode: transientUpstream ? "claude_transient_upstream" : null,
+    errorCode: upstream.errorCode,
+    // errorFamily is the strict shared union (only "transient_upstream"). A
+    // capacity-exhausted run is deliberately NOT tagged transient — that is what
+    // stops core's tight-reschedule loop. Its structured signal rides errorMeta.
     errorFamily: transientUpstream ? "transient_upstream" : null,
+    ...(capacityExhausted
+      ? {
+          errorMeta: {
+            errorFamily: "upstream_capacity_exhausted",
+            upstreamCapacityCode: upstream.capacityCode,
+          } as Record<string, unknown>,
+        }
+      : {}),
     retryNotBefore,
     usage,
     sessionId: resolvedSessionId || null,

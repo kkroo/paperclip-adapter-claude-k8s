@@ -8,6 +8,8 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
   isClaudeTransientUpstreamError,
+  matchClaudeUpstreamCapacityCode,
+  classifyClaudeUpstreamFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
 
@@ -317,6 +319,91 @@ describe("isClaudeTransientUpstreamError", () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+describe("matchClaudeUpstreamCapacityCode", () => {
+  it("returns the penstock exhaustion code from Claude's embedded provider JSON", () => {
+    expect(
+      matchClaudeUpstreamCapacityCode({
+        parsed: {
+          type: "result",
+          is_error: true,
+          result:
+            "API Error: Request rejected (429) · {\"error\":\"capacity unavailable\",\"code\":\"capacity_retry_exhausted\",\"resume_at\":\"2026-07-15T01:59:59.952Z\"}",
+        },
+      }),
+    ).toBe("capacity_retry_exhausted");
+    expect(
+      matchClaudeUpstreamCapacityCode({
+        errorMessage: "Claude run failed: API Error: 503 {\"code\":\"provider_retry_exhausted\"}",
+      }),
+    ).toBe("provider_retry_exhausted");
+    expect(
+      matchClaudeUpstreamCapacityCode({ stderr: "upstream said route_exhausted" }),
+    ).toBe("route_exhausted");
+  });
+
+  it("returns null for a generic throttle with no penstock exhaustion code", () => {
+    expect(
+      matchClaudeUpstreamCapacityCode({
+        parsed: { result: "API Error: 429 rate_limit_error overloaded, try again later" },
+      }),
+    ).toBeNull();
+    expect(matchClaudeUpstreamCapacityCode({})).toBeNull();
+  });
+});
+
+describe("classifyClaudeUpstreamFailure", () => {
+  const capacityResult = {
+    type: "result",
+    is_error: true,
+    result:
+      "API Error: Request rejected (429) · {\"code\":\"capacity_retry_exhausted\",\"resume_at\":\"2026-07-15T01:59:59.952Z\"}",
+  };
+
+  it("classifies a zero-progress penstock exhaustion as terminal (not transient)", () => {
+    expect(
+      classifyClaudeUpstreamFailure({ failed: true, zeroTokenProgress: true, parsed: capacityResult }),
+    ).toEqual({
+      family: "upstream_capacity_exhausted",
+      errorCode: "claude_upstream_capacity_exhausted",
+      capacityCode: "capacity_retry_exhausted",
+    });
+  });
+
+  it("keeps a capacity error TRANSIENT when the run already made token progress", () => {
+    // Mid-run exhaustion (tokens already produced) — a resumed retry is worthwhile,
+    // and the same text still matches the transient regex (429).
+    expect(
+      classifyClaudeUpstreamFailure({ failed: true, zeroTokenProgress: false, parsed: capacityResult }),
+    ).toEqual({ family: "transient_upstream", errorCode: "claude_transient_upstream", capacityCode: null });
+  });
+
+  it("classifies a momentary overload (no exhaustion code) as transient", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: true,
+        parsed: { result: "API Error: 529 {\"type\":\"overloaded_error\"}" },
+      }),
+    ).toEqual({ family: "transient_upstream", errorCode: "claude_transient_upstream", capacityCode: null });
+  });
+
+  it("does not classify a non-failed run", () => {
+    expect(
+      classifyClaudeUpstreamFailure({ failed: false, zeroTokenProgress: true, parsed: capacityResult }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
+  });
+
+  it("does not classify a deterministic error as an upstream failure", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: true,
+        parsed: { subtype: "error_max_turns", result: "Maximum turns reached." },
+      }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
   });
 });
 

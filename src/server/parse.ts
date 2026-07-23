@@ -335,3 +335,82 @@ export function isClaudeTransientUpstreamError(input: {
   if (!haystack) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
+
+/**
+ * Penstock's machine-readable pool-exhaustion outcome codes, surfaced in the
+ * client-facing error body (penstock-llm-proxy-core `writeProxyError`:
+ * `code: <code>`) and embedded by Claude Code into its result text (the same
+ * embedded proxy JSON `extractClaudeRetryNotBefore` reads). Each means the proxy
+ * tried every subscription for the requested model and none could serve it:
+ *   - `capacity_retry_exhausted` — all subscriptions rate-limited (429 + Retry-After)
+ *   - `provider_retry_exhausted` — provider retries exhausted across the pool (503)
+ *   - `route_exhausted`          — no eligible node/route for the request (503)
+ * These tokens are distinctive and only appear in penstock's structured error.
+ */
+const CLAUDE_UPSTREAM_CAPACITY_EXHAUSTED_RE =
+  /(capacity_retry_exhausted|provider_retry_exhausted|route_exhausted)/i;
+
+/**
+ * Return the penstock pool-exhaustion code present in a failed run's output, or
+ * `null`. Matches the code token anywhere in the failure haystack.
+ */
+export function matchClaudeUpstreamCapacityCode(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string | null {
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return null;
+  const match = haystack.match(CLAUDE_UPSTREAM_CAPACITY_EXHAUSTED_RE);
+  return match ? match[1].toLowerCase() : null;
+}
+
+export type ClaudeUpstreamFailureFamily = "upstream_capacity_exhausted" | "transient_upstream";
+
+export interface ClaudeUpstreamClassification {
+  readonly family: ClaudeUpstreamFailureFamily | null;
+  readonly errorCode: "claude_upstream_capacity_exhausted" | "claude_transient_upstream" | null;
+  /** The penstock exhaustion code, set only when `family === "upstream_capacity_exhausted"`. */
+  readonly capacityCode: string | null;
+}
+
+/**
+ * Classify a failed Claude run's upstream-provider outcome. Precedence:
+ *   1. A penstock pool-exhaustion code + ZERO token progress => terminal
+ *      (`upstream_capacity_exhausted`): the requested model tier has no usable
+ *      capacity, so retrying it as a transient throttle loops forever with no
+ *      forward progress (the Fable-5 pool-throttle pathology). Fail fast and
+ *      surface it; the agent's normal heartbeat cadence provides paced retries.
+ *   2. Otherwise a momentary throttle/overload => `transient_upstream` (retry).
+ *   3. Otherwise not an upstream failure (`null`) — a deterministic error.
+ * `zeroTokenProgress` gates (1): a mid-run exhaustion that already produced
+ * tokens is NOT treated as a no-capacity tier — a resumed retry is worthwhile.
+ * Pure and side-effect-free for unit testing.
+ */
+export function classifyClaudeUpstreamFailure(input: {
+  failed: boolean;
+  zeroTokenProgress: boolean;
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): ClaudeUpstreamClassification {
+  if (!input.failed) {
+    return { family: null, errorCode: null, capacityCode: null };
+  }
+  if (input.zeroTokenProgress) {
+    const capacityCode = matchClaudeUpstreamCapacityCode(input);
+    if (capacityCode) {
+      return {
+        family: "upstream_capacity_exhausted",
+        errorCode: "claude_upstream_capacity_exhausted",
+        capacityCode,
+      };
+    }
+  }
+  if (isClaudeTransientUpstreamError(input)) {
+    return { family: "transient_upstream", errorCode: "claude_transient_upstream", capacityCode: null };
+  }
+  return { family: null, errorCode: null, capacityCode: null };
+}
