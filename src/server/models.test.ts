@@ -20,6 +20,7 @@ describe("listK8sModels", () => {
 
   it("returns direct API models by default", async () => {
     const models = await listK8sModels();
+    expect(models.some((m) => m.id === "claude-opus-5")).toBe(true);
     expect(models.some((m) => m.id === "claude-opus-4-8[1m]")).toBe(true);
     expect(models.some((m) => m.id === "claude-sonnet-5")).toBe(true);
     expect(models.some((m) => m.id === "claude-sonnet-4-6[1m]")).toBe(true);
@@ -31,6 +32,7 @@ describe("listK8sModels", () => {
   it("returns Bedrock models when CLAUDE_CODE_USE_BEDROCK=1", async () => {
     process.env.CLAUDE_CODE_USE_BEDROCK = "1";
     const models = await listK8sModels();
+    expect(models.some((m) => m.id === "us.anthropic.claude-opus-5")).toBe(true);
     expect(models.some((m) => m.id === "us.anthropic.claude-sonnet-5")).toBe(true);
     expect(models.some((m) => m.id.includes("anthropic."))).toBe(true);
     expect(models.every((m) => !m.id.startsWith("claude-"))).toBe(true);
