@@ -4,6 +4,14 @@ import type { Writable } from "node:stream";
 import { readFile } from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
+// This suite doesn't exercise per-agent mcp.json layering (that's covered in
+// job-manifest.test.ts), so keep it hermetic against whatever the adapter
+// container's real /paperclip/.mcp.json baseline happens to contain — an
+// ambient non-empty file there would otherwise make buildJobManifest() stage
+// a real mcpConfigSecret (BLO-17980) on every execute() call in this file,
+// with no test-local Secret-create/delete mocking to match.
+process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH = "";
+
 // All K8s API mock functions — declared before vi.mock() so the factory can
 // reference them.  The mock's logApi.log default is a never-resolving promise,
 // simulating the FAR-10 hang where K8s API drops the connection indefinitely.

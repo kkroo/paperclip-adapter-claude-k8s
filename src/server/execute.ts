@@ -252,6 +252,10 @@ interface ActiveJobRef {
   jobName: string;
   promptSecretName?: string;
   promptSecretNamespace?: string;
+  envSecretName?: string;
+  envSecretNamespace?: string;
+  mcpConfigSecretName?: string;
+  mcpConfigSecretNamespace?: string;
   kubeconfigPath?: string;
 }
 const activeJobs = new Set<ActiveJobRef>();
@@ -1248,6 +1252,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // eslint-disable-next-line prefer-const
   let podLogPath!: string;
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
+  let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
+  let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   // runtimeSessionParams and currentSessionIdRaw are also used after the
   // try block (in the result-parsing section) so hoist them here.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -1425,6 +1431,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const claudeArgs = built.claudeArgs;
     const promptMetrics = built.promptMetrics;
     promptSecret = built.promptSecret;
+    envSecret = built.envSecret;
+    mcpConfigSecret = built.mcpConfigSecret;
     podLogPath = built.podLogPath;
     if (built.skippedLabels.length > 0) {
       await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
@@ -1484,6 +1492,89 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
+    // Sensitive-named env vars (BLO-17980/BLO-17973) are staged as a Secret
+    // by buildJobManifest and referenced via secretKeyRef in the Job's env —
+    // create it before the Job the same way as the prompt Secret above, and
+    // clean it up in the finally block. Never log envSecret.data (values).
+    if (envSecret) {
+      try {
+        await coreApi.createNamespacedSecret({
+          namespace: envSecret.namespace,
+          body: {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: {
+              name: envSecret.name,
+              namespace: envSecret.namespace,
+              labels: {
+                "app.kubernetes.io/managed-by": "paperclip",
+                "paperclip.io/adapter-type": "claude_k8s",
+                "paperclip.io/run-id": runId,
+              },
+            },
+            stringData: envSecret.data,
+          },
+        });
+        await onLog("stdout", `[paperclip] Created env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Failed to create env Secret: ${msg}\n`);
+        if (promptSecret) {
+          await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace }).catch(() => undefined);
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Failed to create env Secret: ${msg}`,
+          errorCode: "k8s_env_secret_create_failed",
+        };
+      }
+    }
+
+    // mcp.json (BLO-17980/BLO-17973) routinely embeds MCP server credentials
+    // (e.g. an HTTP-transport server's Authorization header), so it is
+    // always staged as a Secret and mounted read-only by the init container
+    // — never a literal env var. Never log mcpConfigSecret.data (values).
+    if (mcpConfigSecret) {
+      try {
+        await coreApi.createNamespacedSecret({
+          namespace: mcpConfigSecret.namespace,
+          body: {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: {
+              name: mcpConfigSecret.name,
+              namespace: mcpConfigSecret.namespace,
+              labels: {
+                "app.kubernetes.io/managed-by": "paperclip",
+                "paperclip.io/adapter-type": "claude_k8s",
+                "paperclip.io/run-id": runId,
+              },
+            },
+            stringData: mcpConfigSecret.data,
+          },
+        });
+        await onLog("stdout", `[paperclip] Created mcp-config Secret: ${mcpConfigSecret.name}\n`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Failed to create mcp-config Secret: ${msg}\n`);
+        if (promptSecret) {
+          await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace }).catch(() => undefined);
+        }
+        if (envSecret) {
+          await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace }).catch(() => undefined);
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Failed to create mcp-config Secret: ${msg}`,
+          errorCode: "k8s_mcp_config_secret_create_failed",
+        };
+      }
+    }
+
     // Create the Job
     let createdJobUid: string | undefined;
     try {
@@ -1495,6 +1586,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (promptSecret) {
         try {
           await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+        } catch { /* best-effort */ }
+      }
+      if (envSecret) {
+        try {
+          await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
+        } catch { /* best-effort */ }
+      }
+      if (mcpConfigSecret) {
+        try {
+          await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
         } catch { /* best-effort */ }
       }
       return {
@@ -1511,6 +1612,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await coreApi.deleteNamespacedSecret({
           name: promptSecret.name,
           namespace: promptSecret.namespace,
+        }).catch(() => undefined);
+      }
+      if (envSecret) {
+        await coreApi.deleteNamespacedSecret({
+          name: envSecret.name,
+          namespace: envSecret.namespace,
+        }).catch(() => undefined);
+      }
+      if (mcpConfigSecret) {
+        await coreApi.deleteNamespacedSecret({
+          name: mcpConfigSecret.name,
+          namespace: mcpConfigSecret.namespace,
         }).catch(() => undefined);
       }
       return {
@@ -1533,6 +1646,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           namespace: promptSecret.namespace,
         }).catch(() => undefined);
       }
+      if (envSecret) {
+        await coreApi.deleteNamespacedSecret({
+          name: envSecret.name,
+          namespace: envSecret.namespace,
+        }).catch(() => undefined);
+      }
+      if (mcpConfigSecret) {
+        await coreApi.deleteNamespacedSecret({
+          name: mcpConfigSecret.name,
+          namespace: mcpConfigSecret.namespace,
+        }).catch(() => undefined);
+      }
       return {
         exitCode: null,
         signal: null,
@@ -1546,7 +1671,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
     }
 
-    // Attach ownerReference so K8s GC cleans up the Secret if the process
+    // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
     // crashes before the finally block runs.
     if (promptSecret && createdJobUid) {
       try {
@@ -1572,6 +1697,58 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
+      }
+    }
+    if (envSecret && createdJobUid) {
+      try {
+        await coreApi.patchNamespacedSecret({
+          name: envSecret.name,
+          namespace: envSecret.namespace,
+          body: [
+            {
+              op: "add",
+              path: "/metadata/ownerReferences",
+              value: [
+                {
+                  apiVersion: "batch/v1",
+                  kind: "Job",
+                  name: jobName,
+                  uid: createdJobUid,
+                  blockOwnerDeletion: false,
+                },
+              ],
+            },
+          ],
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on env Secret: ${msg}\n`);
+      }
+    }
+    if (mcpConfigSecret && createdJobUid) {
+      try {
+        await coreApi.patchNamespacedSecret({
+          name: mcpConfigSecret.name,
+          namespace: mcpConfigSecret.namespace,
+          body: [
+            {
+              op: "add",
+              path: "/metadata/ownerReferences",
+              value: [
+                {
+                  apiVersion: "batch/v1",
+                  kind: "Job",
+                  name: jobName,
+                  uid: createdJobUid,
+                  blockOwnerDeletion: false,
+                },
+              ],
+            },
+          ],
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);
       }
     }
 
@@ -1612,6 +1789,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     namespace,
     jobName,
     ...(promptSecret ? { promptSecretName: promptSecret.name, promptSecretNamespace: promptSecret.namespace } : {}),
+    ...(envSecret ? { envSecretName: envSecret.name, envSecretNamespace: envSecret.namespace } : {}),
+    ...(mcpConfigSecret ? { mcpConfigSecretName: mcpConfigSecret.name, mcpConfigSecretNamespace: mcpConfigSecret.namespace } : {}),
     kubeconfigPath,
   };
   activeJobs.add(activeJobRef);
@@ -1834,6 +2013,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (promptSecret) {
       try {
         await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+      } catch {
+        // Best-effort cleanup — TTL or manual deletion will catch stragglers
+      }
+    }
+    // Clean up env Secret if one was created (BLO-17980/BLO-17973)
+    if (envSecret) {
+      try {
+        await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
+      } catch {
+        // Best-effort cleanup — TTL or manual deletion will catch stragglers
+      }
+    }
+    // Clean up mcp-config Secret if one was created (BLO-17980/BLO-17973)
+    if (mcpConfigSecret) {
+      try {
+        await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
       } catch {
         // Best-effort cleanup — TTL or manual deletion will catch stragglers
       }

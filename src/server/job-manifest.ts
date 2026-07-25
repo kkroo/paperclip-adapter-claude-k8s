@@ -356,6 +356,62 @@ export interface PromptSecret {
   data: Record<string, string>;
 }
 
+/** Non-null when one or more env vars matched the sensitive-name pattern
+ *  (see isSensitiveEnvName). Their values are moved out of the Job's
+ *  env[].value into this Secret and referenced via secretKeyRef instead, so
+ *  a read-only `GET Pod` on the Job never returns them (BLO-17980/BLO-17973).
+ *  Same lifecycle as promptSecret: the caller creates it before the Job and
+ *  cleans it up after. */
+export interface EnvSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+/** Non-null whenever a merged mcp.json is shipped to the pod. mcp.json
+ *  commonly embeds MCP server credentials (e.g. an `Authorization: Bearer
+ *  ...` header for an HTTP-transport server, or stdio server env) supplied
+ *  via adapterConfig.mcpServers — unlike the name-based EnvSecret routing,
+ *  there is no single env-var name to key off, so mcp.json is always
+ *  staged as a Secret-backed volume instead of the init container's
+ *  MCP_CONFIG env, regardless of size (BLO-17980/BLO-17973). Same
+ *  lifecycle as promptSecret: the caller creates it before the Job and
+ *  cleans it up after. */
+export interface McpConfigSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+/**
+ * Env var name patterns that must never carry a literal Job-pod value.
+ * Matches anywhere in the name, case-insensitive. A false-positive match
+ * only costs an extra secretKeyRef indirection; a false negative is the
+ * exact defect BLO-17980/BLO-17973 report (credential material readable
+ * via a plain `GET Pod` through the read-only Kubernetes MCP), so this is
+ * intentionally broad.
+ */
+const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
+
+export function isSensitiveEnvName(name: string): boolean {
+  return SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+/**
+ * Defense-in-depth: return the names of any container env entries with a
+ * sensitive-looking name that still carry a literal `value`. buildEnvVars()
+ * never produces these, but this runs unconditionally in buildJobManifest
+ * (after every push onto the env array, including ones added later for
+ * sidecar wiring) so a future code path that appends a literal env var
+ * can't silently reintroduce the leak — buildJobManifest throws instead of
+ * returning a Pod spec that would expose it via `GET Pod`.
+ */
+export function findLiteralSensitiveEnvVars(env: k8s.V1EnvVar[]): string[] {
+  return env
+    .filter((e) => e.name && isSensitiveEnvName(e.name) && typeof e.value === "string" && e.value.length > 0)
+    .map((e) => e.name);
+}
+
 export interface JobBuildResult {
   job: k8s.V1Job;
   jobName: string;
@@ -366,6 +422,13 @@ export interface JobBuildResult {
   /** Non-null when the prompt is too large for an env var and must be
    *  staged as a K8s Secret before creating the Job. */
   promptSecret: PromptSecret | null;
+  /** Non-null when one or more env vars matched the sensitive-name pattern
+   *  and must be staged as a K8s Secret (referenced via secretKeyRef)
+   *  before creating the Job. */
+  envSecret: EnvSecret | null;
+  /** Non-null whenever a merged mcp.json is shipped to the pod — always
+   *  Secret-backed, never a literal init-container env var (BLO-17980/BLO-17973). */
+  mcpConfigSecret: McpConfigSecret | null;
   /** User-supplied extra labels that were dropped because they used a reserved prefix. */
   skippedLabels: string[];
   /** Path to the pod log file on the shared PVC. */
@@ -414,7 +477,8 @@ function buildEnvVars(
   selfPod: SelfPodInfo,
   config: Record<string, unknown>,
   isolation: JobIsolation,
-): k8s.V1EnvVar[] {
+  envSecretName: string,
+): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string> } {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
 
@@ -549,11 +613,20 @@ function buildEnvVars(
     if (!userEnvKeys.has(key)) merged[key] = value;
   }
 
-  // Convert literal env to V1EnvVar array
-  const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
-    name,
-    value,
-  }));
+  // Convert literal env to V1EnvVar array. Names matching the sensitive
+  // pattern (isSensitiveEnvName) are routed to a Secret referenced via
+  // secretKeyRef instead of an inline literal `value`, so a read-only
+  // `GET Pod` on the Job never returns their contents (BLO-17980/BLO-17973).
+  const sensitiveEnvData: Record<string, string> = {};
+  const envVars: k8s.V1EnvVar[] = [];
+  for (const [name, value] of Object.entries(merged)) {
+    if (isSensitiveEnvName(name) && value) {
+      sensitiveEnvData[name] = value;
+      envVars.push({ name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } });
+    } else {
+      envVars.push({ name, value });
+    }
+  }
 
   // Append valueFrom entries from the Deployment container (secretKeyRef,
   // configMapKeyRef, fieldRef, etc.).  Skip any whose name was already set
@@ -565,7 +638,7 @@ function buildEnvVars(
     }
   }
 
-  return envVars;
+  return { envVars, sensitiveEnvData };
 }
 
 /**
@@ -777,8 +850,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   }
   if (extraArgs.length > 0) claudeArgs.push(...extraArgs);
 
-  // Build env vars
-  const envVars = buildEnvVars(ctx, selfPod, config, isolation);
+  // Build env vars. envSecretName is computed from jobName (already resolved
+  // above) so sensitive-named vars can be wired to secretKeyRef in one pass.
+  const envSecretName = `${jobName}-env`;
+  const { envVars, sensitiveEnvData } = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
+  const envSecret: EnvSecret | null =
+    Object.keys(sensitiveEnvData).length > 0 ? { name: envSecretName, namespace, data: sensitiveEnvData } : null;
 
   // Resource defaults — UI stores dotted keys (e.g. "resources.requests.cpu")
   // as flat config entries, so read them directly from config with the dotted key.
@@ -1036,18 +1113,31 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build the init container — writes the prompt (always) and, when an
   // agent supplied adapterConfig.mcpServers, the merged mcp.json next to
-  // it in the same prompt emptyDir. mcp.json is small (~few kB) so the
-  // env-var path is fine even when the prompt itself goes the
-  // Secret-volume route for size.
+  // it in the same prompt emptyDir. mcp.json routinely embeds MCP server
+  // credentials (e.g. an HTTP-transport server's `Authorization` header,
+  // or stdio server env) supplied via adapterConfig.mcpServers, so — unlike
+  // the prompt, which only goes Secret-backed above a size threshold —
+  // mcp.json is ALWAYS staged as a Secret-backed volume, never a literal
+  // init-container env var, regardless of size (BLO-17980/BLO-17973).
   const initCommandParts = useLargePromptPath
     ? ["cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"]
     : [`printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`];
   const initEnv: k8s.V1EnvVar[] = useLargePromptPath
     ? []
     : [{ name: "PROMPT_CONTENT", value: prompt }];
+  let mcpConfigSecret: McpConfigSecret | null = null;
   if (mergedMcpJson) {
-    initCommandParts.push(`printf '%s' "$MCP_CONFIG" > /tmp/prompt/mcp.json`);
-    initEnv.push({ name: "MCP_CONFIG", value: mergedMcpJson });
+    const mcpConfigSecretName = `${jobName}-mcp`;
+    mcpConfigSecret = {
+      name: mcpConfigSecretName,
+      namespace,
+      data: { "mcp.json": mergedMcpJson },
+    };
+    volumes.push({
+      name: "mcp-config-secret",
+      secret: { secretName: mcpConfigSecretName, optional: false },
+    });
+    initCommandParts.push("cp /tmp/mcp-secret/mcp.json /tmp/prompt/mcp.json");
   }
   // Redirect Chrome's BrowserMetrics spool to the per-pod ephemeral
   // runtime-cache. The `agent-browser` designer tool launches system Chrome
@@ -1087,6 +1177,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       readOnly: true,
     });
   }
+  if (mcpConfigSecret) {
+    initVolumeMounts.push({
+      name: "mcp-config-secret",
+      mountPath: "/tmp/mcp-secret",
+      readOnly: true,
+    });
+  }
   const initContainer: k8s.V1Container = {
     name: "write-prompt",
     image: "busybox:1.36",
@@ -1100,6 +1197,25 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       limits: { cpu: "100m", memory: "64Mi" },
     },
   };
+
+  // Defense-in-depth (BLO-17980/BLO-17973): fail the build rather than ship a
+  // Pod spec that would expose a credential-shaped env var via `GET Pod`.
+  // envVars only carries literal values for non-sensitive names at this
+  // point, but this check also covers anything appended above (e.g. the
+  // DinD DOCKER_HOST wiring) so a future addition can't silently regress it.
+  // Also covers the init container's env (initEnv): MCP_CONFIG is no longer
+  // injected there at all (mcp.json is always Secret-backed above), but this
+  // guard still catches any future sensitive-named literal added to either
+  // container.
+  const literalSensitiveNames = [
+    ...findLiteralSensitiveEnvVars(envVars),
+    ...findLiteralSensitiveEnvVars(initEnv),
+  ];
+  if (literalSensitiveNames.length > 0) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
+    );
+  }
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
@@ -1153,5 +1269,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, skippedLabels, podLogPath };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath };
 }
