@@ -660,6 +660,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const configuredCwd = asString(config.cwd, "");
   const workingDir = isolation.enabled ? isolation.workspaceRoot : workspaceCwd || configuredCwd || "/paperclip";
+  const containerWorkingDir =
+    isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
+      ? isolation.root || path.posix.dirname(isolation.workspaceRoot) || "/paperclip"
+      : workingDir;
 
   // Build a deterministic, collision-resistant job name within the 63-char
   // DNS label limit.  Layout: "ac-{agentSlug}-{runSlug}-{hash}" where the
@@ -1134,7 +1138,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               name: "claude",
               image,
               imagePullPolicy: asString(config.imagePullPolicy, "IfNotPresent"),
-              workingDir,
+              workingDir: containerWorkingDir,
               command: ["sh", "-c", mainCommand],
               env: envVars,
               ...(selfPod.inheritedEnvFrom.length > 0 ? { envFrom: selfPod.inheritedEnvFrom } : {}),

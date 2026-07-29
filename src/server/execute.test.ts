@@ -64,7 +64,16 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   });
 });
 
-const { isK8s404, buildPartialRunError, classifyOrphan, describePodTerminatedError, describeTruncationCause, streamPodLogsOnce, shouldAbortForCancellation, execute } = await import("./execute.js");
+const {
+  isK8s404,
+  buildPartialRunError,
+  classifyOrphan,
+  describePodTerminatedError,
+  describeTruncationCause,
+  extractContainerLogDiagnostic,
+  shouldAbortForCancellation,
+  execute,
+} = await import("./execute.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -290,6 +299,36 @@ describe("buildPartialRunError", () => {
   it("does not append anything when podState is null (back-compat)", () => {
     const msg = buildPartialRunError(1, "claude-sonnet-4-6", initLine, null);
     expect(msg).not.toContain("[pod:");
+  });
+
+  it("appends a container log tail for empty stdout failures", () => {
+    const msg = buildPartialRunError(128, "claude-opus-5[1m]", "", {
+      exitCode: 128,
+      reason: "Error",
+      message: null,
+      signal: null,
+    }, "OAuth failed: Bearer <redacted> and token=<redacted>");
+
+    expect(msg).toContain("Claude exited with code 128");
+    expect(msg).toContain("reason=Error");
+    expect(msg).toContain("container_log=OAuth failed: Bearer <redacted>");
+    expect(msg).toContain("token=<redacted>");
+  });
+
+  it("redacts sensitive tokens in container log diagnostics", () => {
+    const diagnostic = extractContainerLogDiagnostic([
+      "ignored",
+      "OAuth failed: Bearer eyJhbGciOiFake.token and token=secret-value",
+      "figma=figd_secret gbrain=gbrain_at_secret api_key=abc123",
+    ].join("\n"));
+
+    expect(diagnostic).toContain("OAuth failed: Bearer <redacted>");
+    expect(diagnostic).toContain("token=<redacted>");
+    expect(diagnostic).toContain("figd_<redacted>");
+    expect(diagnostic).toContain("gbrain_at_<redacted>");
+    expect(diagnostic).toContain("api_key=<redacted>");
+    expect(diagnostic).not.toContain("eyJhbGciOiFake");
+    expect(diagnostic).not.toContain("secret-value");
   });
 });
 

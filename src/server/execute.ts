@@ -601,6 +601,63 @@ function firstContentLine(stdout: string): string {
     }) ?? "";
 }
 
+function truncateMiddle(value: string, max = 800): string {
+  if (value.length <= max) return value;
+  const head = Math.max(0, Math.floor((max - 15) / 2));
+  const tail = Math.max(0, max - 15 - head);
+  return `${value.slice(0, head)} ...[truncated]... ${value.slice(value.length - tail)}`;
+}
+
+function redactDiagnosticLogLine(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._:=/-]+/gi, "Bearer <redacted>")
+    .replace(/\beyJ[A-Za-z0-9._-]+/g, "<jwt-redacted>")
+    .replace(/\bfigd_[A-Za-z0-9._-]+/g, "figd_<redacted>")
+    .replace(/\bgbrain_at_[A-Za-z0-9._-]+/g, "gbrain_at_<redacted>")
+    .replace(/\bGOCSPX-[A-Za-z0-9_-]+/g, "GOCSPX-<redacted>")
+    .replace(/\bsk-[A-Za-z0-9_-]+/g, "sk-<redacted>")
+    .replace(/\b[A-Za-z0-9_-]{20,}:[A-Za-z0-9_-]{10,}:[A-Za-z0-9_-]{20,}\b/g, "<compound-token-redacted>")
+    .replace(/\b(token|secret|password|api[_-]?key)=\S+/gi, "$1=<redacted>");
+}
+
+export function extractContainerLogDiagnostic(raw: string): string | null {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => redactDiagnosticLogLine(line.trim()))
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return null;
+  return truncateMiddle(lines.slice(-5).join(" | "));
+}
+
+function normalizePodLogResponse(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const body = (value as { body?: unknown }).body;
+    if (typeof body === "string") return body;
+  }
+  return "";
+}
+
+async function readPodContainerLogTail(input: {
+  namespace: string;
+  podName: string;
+  kubeconfigPath?: string;
+}): Promise<string | null> {
+  const coreApi = getCoreApi(input.kubeconfigPath);
+  try {
+    const raw = await coreApi.readNamespacedPodLog({
+      name: input.podName,
+      namespace: input.namespace,
+      container: "claude",
+      tailLines: 120,
+    });
+    return extractContainerLogDiagnostic(normalizePodLogResponse(raw));
+  } catch (err) {
+    if (isK8s404(err)) return null;
+    return `failed to read pod log: ${redactDiagnosticLogLine(err instanceof Error ? err.message : String(err))}`;
+  }
+}
+
 /**
  * Returns true when stdout contains only init/system/assistant events from the
  * given model with no human-readable content lines.  Used to detect init-only
@@ -623,13 +680,13 @@ function isInitOnlyRun(model: string, stdout: string): boolean {
  * specifically reason (e.g. OOMKilled, Error, ContainerCannotRun), message
  * (kubelet diagnostic text), and signal.  Saves the operator a kubectl trip.
  */
-function appendPodCause(message: string, state: PodTerminatedState | null): string {
-  if (!state) return message;
+function appendPodCause(message: string, state: PodTerminatedState | null, containerLogTail: string | null = null): string {
   const parts: string[] = [];
-  if (state.reason) parts.push(`reason=${state.reason}`);
-  if (state.message) parts.push(`message=${state.message}`);
-  if (state.signal !== null) parts.push(`signal=${state.signal}`);
-  if (state.exitCode === 137) parts.push("SIGKILL (commonly OOMKilled)");
+  if (state?.reason) parts.push(`reason=${state.reason}`);
+  if (state?.message) parts.push(`message=${state.message}`);
+  if (state?.signal !== null && state?.signal !== undefined) parts.push(`signal=${state.signal}`);
+  if (state?.exitCode === 137) parts.push("SIGKILL (commonly OOMKilled)");
+  if (containerLogTail) parts.push(`container_log=${containerLogTail}`);
   if (parts.length === 0) return message;
   return `${message} [pod: ${parts.join(", ")}]`;
 }
@@ -646,6 +703,7 @@ export function buildPartialRunError(
   model: string,
   stdout: string,
   podState: PodTerminatedState | null = null,
+  containerLogTail: string | null = null,
 ): string {
   if (exitCode === 0) return "Failed to parse Claude JSON output";
 
@@ -654,7 +712,7 @@ export function buildPartialRunError(
   // or unsupported/misconfigured model.
   const contentLine = firstContentLine(stdout);
   if (contentLine) {
-    return appendPodCause(`Claude exited with code ${exitCode ?? -1}: ${contentLine}`, podState);
+    return appendPodCause(`Claude exited with code ${exitCode ?? -1}: ${contentLine}`, podState, containerLogTail);
   }
 
   if (isInitOnlyRun(model, stdout) && (exitCode ?? 0) !== 0) {
@@ -662,6 +720,7 @@ export function buildPartialRunError(
     return appendPodCause(
       `Claude exited immediately after init${modelHint} (exit code ${exitCode ?? -1}) — the model may be unsupported or the session may have been rejected before producing output`,
       podState,
+      containerLogTail,
     );
   }
 
@@ -671,10 +730,11 @@ export function buildPartialRunError(
     return appendPodCause(
       `Claude started but did not produce a result${modelHint} — check API credentials, model support, and adapter config`,
       podState,
+      containerLogTail,
     );
   }
 
-  return appendPodCause(`Claude exited with code ${exitCode ?? -1}`, podState);
+  return appendPodCause(`Claude exited with code ${exitCode ?? -1}`, podState, containerLogTail);
 }
 
 export type OrphanClassification =
@@ -1545,6 +1605,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     pollCount: 0,
   };
   let podRunningAt: number | null = null;
+  let podName: string | null = null;
+  let containerLogTail: string | null = null;
 
   const activeJobRef: ActiveJobRef = {
     namespace,
@@ -1559,7 +1621,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Wait for pod to be ready for log streaming
     const scheduleTimeoutMs = Math.max(0, asNumber(config.podScheduleTimeoutSec, 120)) * 1000;
     const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 600)) * 1000;
-    let podName: string;
     try {
       podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
@@ -1753,6 +1814,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     podTerminatedState = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
     exitCode = podTerminatedState?.exitCode ?? null;
+    if ((exitCode ?? 0) !== 0 && podName) {
+      containerLogTail = await readPodContainerLogTail({ namespace, podName, kubeconfigPath });
+      if (containerLogTail) {
+        await onLog("stderr", `[paperclip] failed pod container log tail: ${containerLogTail}\n`);
+      }
+    }
   } finally {
     if (keepaliveTimer) clearInterval(keepaliveTimer);
     activeJobs.delete(activeJobRef);
@@ -1908,7 +1975,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode,
       signal: null,
       timedOut: false,
-      errorMessage: buildPartialRunError(exitCode, parsedStream.model, stdout, podTerminatedState),
+      errorMessage: buildPartialRunError(exitCode, parsedStream.model, stdout, podTerminatedState, containerLogTail),
       resultJson: { stdout },
     };
   }
