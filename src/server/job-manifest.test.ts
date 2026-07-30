@@ -557,7 +557,7 @@ describe("buildJobManifest", () => {
       const container = job.spec?.template?.spec?.containers[0];
       const env = new Map(container?.env?.map((entry) => [entry.name, entry.value]));
       const command = container?.command?.join(" ") ?? "";
-      expect(container?.workingDir).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
+      expect(container?.workingDir).toBe("/runtime-cache/paperclip-runs/run-abc12345");
       expect(env.get("HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/home");
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/runtime-cache/paperclip-runs/run-abc12345/session/.claude");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/cache/xdg");
