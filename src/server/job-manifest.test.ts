@@ -10,6 +10,7 @@ import {
   sanitizeLabelValue,
   isSensitiveEnvName,
   findLiteralSensitiveEnvVars,
+  findLiteralSensitiveEnvVarsInPodSpec,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
@@ -1666,5 +1667,45 @@ describe("paperclipTaskMarkdown surfacing", () => {
     expect(result.promptMetrics.taskMarkdownChars).toBeGreaterThan(0);
     expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
     expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+});
+
+describe("fail-closed sensitive-env guard covers every container on the pod", () => {
+  // BLO-21593 review finding: the guard used to enumerate the envVars/initEnv
+  // locals, so the DinD sidecar — whose env is built inside buildDindSidecar()
+  // and never flows through those locals — silently bypassed it. These pin the
+  // check to the assembled pod spec instead.
+
+  it("flags a sensitive literal in a sidecar container, not just the main one", () => {
+    const podSpec = {
+      initContainers: [
+        { name: "write-prompt", env: [{ name: "PROMPT_FILE", value: "/tmp/p" }] },
+        { name: "dind", env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }, { name: "REGISTRY_TOKEN", value: "leaked" }] },
+      ],
+      containers: [{ name: "claude", env: [{ name: "AWS_REGION", value: "us-east-1" }] }],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+
+    // The old per-array check, applied to the main container's env only, sees nothing.
+    expect(findLiteralSensitiveEnvVars(podSpec.containers![0].env ?? [])).toEqual([]);
+    // The pod-spec-wide check catches it, and names the offending container.
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual(["dind/REGISTRY_TOKEN"]);
+  });
+
+  it("ignores the sidecar's non-sensitive literals", () => {
+    const podSpec = {
+      initContainers: [{ name: "dind", env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }] }],
+      containers: [{ name: "claude", env: [] }],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+  });
+
+  it("guards the DinD sidecar that buildJobManifest actually assembles", () => {
+    const ctx = makeCtx({ config: { enableDocker: true } });
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const podSpec = job.spec!.template.spec!;
+    // The sidecar is on the pod...
+    expect(podSpec.initContainers!.map((c) => c.name)).toContain("dind");
+    // ...and is inside the guard's field of view (it returns clean today).
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
   });
 });

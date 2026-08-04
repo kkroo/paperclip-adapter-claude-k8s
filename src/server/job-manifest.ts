@@ -412,6 +412,28 @@ export function findLiteralSensitiveEnvVars(env: k8s.V1EnvVar[]): string[] {
     .map((e) => e.name);
 }
 
+/**
+ * Same check as findLiteralSensitiveEnvVars, but driven off the pod spec that
+ * was actually assembled rather than off the individual env arrays the caller
+ * happens to remember to pass in. Every container that ends up on the pod is
+ * covered — main, init, native sidecars (the DinD sidecar is an init container
+ * with restartPolicy: Always) and ephemeral — so adding a container can't
+ * silently escape the guard the way it could when the check enumerated two
+ * hand-maintained local arrays.
+ *
+ * Returns `container/ENV_NAME` so the failure names the offending container.
+ */
+export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((c) =>
+    findLiteralSensitiveEnvVars(c.env ?? []).map((name) => `${c.name || "<unnamed>"}/${name}`),
+  );
+}
+
 export interface JobBuildResult {
   job: k8s.V1Job;
   jobName: string;
@@ -1198,25 +1220,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  // Defense-in-depth (BLO-17980/BLO-17973): fail the build rather than ship a
-  // Pod spec that would expose a credential-shaped env var via `GET Pod`.
-  // envVars only carries literal values for non-sensitive names at this
-  // point, but this check also covers anything appended above (e.g. the
-  // DinD DOCKER_HOST wiring) so a future addition can't silently regress it.
-  // Also covers the init container's env (initEnv): MCP_CONFIG is no longer
-  // injected there at all (mcp.json is always Secret-backed above), but this
-  // guard still catches any future sensitive-named literal added to either
-  // container.
-  const literalSensitiveNames = [
-    ...findLiteralSensitiveEnvVars(envVars),
-    ...findLiteralSensitiveEnvVars(initEnv),
-  ];
-  if (literalSensitiveNames.length > 0) {
-    throw new Error(
-      `claude_k8s: refusing to build Job manifest — sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
-    );
-  }
-
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
     kind: "Job",
@@ -1268,6 +1271,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       },
     },
   };
+
+  // Defense-in-depth (BLO-17980/BLO-17973): fail the build rather than ship a
+  // Pod spec that would expose a credential-shaped env var via `GET Pod`.
+  // Deliberately checked against the assembled pod spec, not against the
+  // envVars/initEnv locals: the pod also carries the DinD sidecar container,
+  // whose env is built inside buildDindSidecar() and never passed through
+  // those locals. Reading the containers back off the spec means any container
+  // added later is covered automatically instead of silently bypassing this.
+  const literalSensitiveNames = findLiteralSensitiveEnvVarsInPodSpec(job.spec!.template.spec!);
+  if (literalSensitiveNames.length > 0) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
+    );
+  }
 
   return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath };
 }
