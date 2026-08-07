@@ -104,6 +104,20 @@ function makeJob(opts: {
   } as k8s.V1Job;
 }
 
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. Tests in this file exercise unrelated execute() behavior and
+// don't set serviceAccountName per-ctx, so give them a working default here;
+// tests that specifically cover the resolution/refusal behavior live in
+// job-manifest.test.ts and manage this env var themselves.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
+
 describe("isK8s404", () => {
   it("returns false for non-Error values", () => {
     expect(isK8s404(null)).toBe(false);

@@ -39,7 +39,7 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "text",
       key: "serviceAccountName",
       label: "Service Account",
-      hint: "Service Account name for Job pods. Defaults to the cluster default.",
+      hint: "Service Account name for Job pods. Required — falls back to PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME (an adapter Deployment-level fleet default) when unset, and refuses to launch the run if neither resolves. Never silently falls back to the namespace's `default` ServiceAccount, which has no cluster-scoped read.",
     },
     {
       type: "text",
