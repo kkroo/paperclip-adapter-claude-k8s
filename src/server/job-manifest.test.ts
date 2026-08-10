@@ -71,6 +71,19 @@ function createClaudeConfigDirWithSession(sessionId: string, workingDir = "/pape
   return configDir;
 }
 
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. File-scoped so every describe block below gets a working
+// default; the "serviceAccountName" describe block overrides/clears it
+// per case to exercise the actual resolution and refusal behavior.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
+
 describe("buildJobManifest", () => {
   let ctx: AdapterExecutionContext;
   let selfPod: SelfPodInfo;
@@ -1121,9 +1134,29 @@ describe("buildJobManifest", () => {
       expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
     });
 
-    it("omits serviceAccountName when not configured", () => {
+    it("echoes the resolved serviceAccountName on the result for log/manifest discoverability", () => {
+      ctx.config = { serviceAccountName: "paperclip-agent" };
+      const { serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(serviceAccountName).toBe("paperclip-agent");
+    });
+
+    it("falls back to PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME when the per-agent value is unset", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip");
+      expect(serviceAccountName).toBe("paperclip");
+    });
+
+    it("prefers the per-agent serviceAccountName over the fleet default", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      ctx.config = { serviceAccountName: "paperclip-agent" };
       const { job } = buildJobManifest({ ctx, selfPod });
-      expect(job.spec?.template?.spec?.serviceAccountName).toBeUndefined();
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
+    });
+
+    it("refuses to build the manifest — never silently lands on the namespace `default` ServiceAccount — when neither serviceAccountName nor the fleet default is set", () => {
+      delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
     });
   });
 

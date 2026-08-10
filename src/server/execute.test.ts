@@ -85,6 +85,8 @@ const {
 
 function makeJob(opts: {
   runId?: string;
+  name?: string;
+  uid?: string;
   agentId?: string;
   taskId?: string;
   sessionId?: string;
@@ -103,12 +105,26 @@ function makeJob(opts: {
   if (opts.isolationMode) labels["paperclip.io/isolation-mode"] = opts.isolationMode;
   if (opts.isolationKey) labels["paperclip.io/isolation-key"] = opts.isolationKey;
   return {
-    metadata: { name: "ac-job", namespace: "paperclip", labels },
+    metadata: { name: opts.name ?? "ac-job", uid: opts.uid, namespace: "paperclip", labels },
     status: opts.terminal
       ? { conditions: [{ type: "Complete", status: "True" }] }
       : { conditions: [] },
   } as k8s.V1Job;
 }
+
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. Tests in this file exercise unrelated execute() behavior and
+// don't set serviceAccountName per-ctx, so give them a working default here;
+// tests that specifically cover the resolution/refusal behavior live in
+// job-manifest.test.ts and manage this env var themselves.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
 
 describe("isK8s404", () => {
   it("returns false for non-Error values", () => {
@@ -709,6 +725,34 @@ describe("execute: concurrency guard", () => {
     expect(mockBatchDeleteJob).not.toHaveBeenCalled();
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(result.errorMessage).toContain("active run");
+  });
+
+  it("ignores only the exact persisted lifecycle Job for the current run", async () => {
+    const current = makeJob({ runId: "run-test-001", agentId: "agent-abc", name: "current-job", uid: "current-uid" });
+    mockBatchListJobs.mockResolvedValue({ items: [current] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    const result = await execute(makeCtx({
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
+    }));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("create reached");
+  });
+
+  it("blocks a second same-run Job even when the current lifecycle Job is present", async () => {
+    const current = makeJob({ runId: "run-test-001", agentId: "agent-abc", name: "current-job", uid: "current-uid" });
+    const duplicate = makeJob({ runId: "run-test-001", agentId: "agent-abc", name: "duplicate-job", uid: "duplicate-uid" });
+    mockBatchListJobs.mockResolvedValue({ items: [current, duplicate] });
+
+    const result = await execute(makeCtx({
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
+    }));
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorMessage).toContain("duplicate-job");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
   });
 
   it("allows active jobs with a different isolation key", async () => {

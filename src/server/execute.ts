@@ -1258,6 +1258,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // try block (in the result-parsing section) so hoist them here.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const currentSessionIdRaw = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  const currentJobIdentity = (ctx as AdapterExecutionContext & {
+    externalRuntime?: { jobName?: string | null; jobUid?: string | null };
+  }).externalRuntime;
   const coreApi = getCoreApi(kubeconfigPath);
   const batchApi = getBatchApi(kubeconfigPath);
 
@@ -1284,6 +1287,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const jobNamespace = job.metadata?.namespace ?? guardNamespace;
 
         const conflictingIdentity = readJobGuardIdentity(job);
+
+        if (
+          jobRunId === runId
+          && currentJobIdentity?.jobName
+          && currentJobIdentity.jobUid
+          && job.metadata?.name === currentJobIdentity.jobName
+          && job.metadata?.uid === currentJobIdentity.jobUid
+        ) {
+          await onLog("stdout", `[paperclip] Ignoring current lifecycle Job ${jobName} during concurrency admission.\n`);
+          continue;
+        }
 
         if (!jobRunId) {
           await onLog("stderr", `[paperclip] Blocked: running Job ${jobName} has no ${RUN_ID_LABEL} provenance label\n`);
@@ -1434,6 +1448,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     envSecret = built.envSecret;
     mcpConfigSecret = built.mcpConfigSecret;
     podLogPath = built.podLogPath;
+    await onLog("stdout", `[paperclip] Resolved ServiceAccount: ${built.serviceAccountName}\n`);
     if (built.skippedLabels.length > 0) {
       await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
     }
@@ -1448,6 +1463,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         commandNotes: [
           `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
           `Namespace: ${namespace}`,
+          `ServiceAccount: ${built.serviceAccountName}`,
           `Timeout: ${timeoutSec}s`,
           `Skills (${desiredSkills.length}): ${skillSummary}`,
         ],
