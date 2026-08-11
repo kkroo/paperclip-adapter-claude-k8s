@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { buildJobManifest, buildPodLogPath, sanitizeLabelValue } from "./job-manifest.js";
+import {
+  buildJobManifest,
+  buildPodLogPath,
+  sanitizeLabelValue,
+  isSensitiveEnvName,
+  findLiteralSensitiveEnvVars,
+  findLiteralSensitiveEnvVarsInPodSpec,
+} from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -529,7 +536,7 @@ describe("buildJobManifest", () => {
 
     it("scopes HOME, Claude config, caches, cwd, and logs to the isolation key", () => {
       ctx.config = { isolationMode: "isolated", isolationKey: "pr-review-123" };
-      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
+      const { job, podLogPath, envSecret } = buildJobManifest({ ctx, selfPod });
       const container = job.spec?.template?.spec?.containers[0];
       const env = new Map(container?.env?.map((e) => [e.name, e.value]));
       const command = container?.command?.join(" ") ?? "";
@@ -541,7 +548,14 @@ describe("buildJobManifest", () => {
       expect(env.get("TMPDIR")).toBe(`${root}/tmp`);
       expect(env.get("TMP")).toBe(`${root}/tmp`);
       expect(env.get("TEMP")).toBe(`${root}/tmp`);
-      expect(env.get("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("pr-review-123");
+      // PAPERCLIP_K8S_ISOLATION_KEY matches the sensitive-name pattern (contains
+      // "KEY") even though it's a path-scoping identifier, not a credential —
+      // an accepted false positive (BLO-17980): it still routes through
+      // secretKeyRef instead of a literal value.
+      const isolationKeyEntry = container?.env?.find((e) => e.name === "PAPERCLIP_K8S_ISOLATION_KEY");
+      expect(isolationKeyEntry?.value).toBeUndefined();
+      expect(isolationKeyEntry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.PAPERCLIP_K8S_ISOLATION_KEY).toBe("pr-review-123");
       expect(podLogPath).toBe("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123/run-abc12345.pod.ndjson");
       expect(command).toContain(
         "mkdir -p '/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/pr-review-123'",
@@ -689,20 +703,30 @@ describe("buildJobManifest", () => {
       expect(env.get("GOCACHE")).toBe("/custom-go-cache");
     });
 
-    it("inherits env vars from selfPod", () => {
+    it("inherits env vars from selfPod, routing the credential-shaped one through a Secret", () => {
       selfPod.inheritedEnv = { ANTHROPIC_API_KEY: "sk-abc", AWS_REGION: "us-east-1" };
-      const { job } = buildJobManifest({ ctx, selfPod });
-      const envNames = job.spec?.template?.spec?.containers[0]?.env?.map((e) => e.name) ?? [];
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
+      const env = job.spec?.template?.spec?.containers[0]?.env ?? [];
+      const envNames = env.map((e) => e.name);
       expect(envNames).toContain("ANTHROPIC_API_KEY");
       expect(envNames).toContain("AWS_REGION");
+      const apiKeyEntry = env.find((e) => e.name === "ANTHROPIC_API_KEY");
+      expect(apiKeyEntry?.value).toBeUndefined();
+      expect(apiKeyEntry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.ANTHROPIC_API_KEY).toBe("sk-abc");
+      const regionEntry = env.find((e) => e.name === "AWS_REGION");
+      expect(regionEntry?.value).toBe("us-east-1");
     });
 
-    it("inherits ANTHROPIC_AUTH_TOKEN from selfPod for API auth", () => {
+    it("inherits ANTHROPIC_AUTH_TOKEN from selfPod for API auth via secretKeyRef, not a literal value", () => {
       selfPod.inheritedEnv = { ANTHROPIC_AUTH_TOKEN: "sk-test" };
-      const { job } = buildJobManifest({ ctx, selfPod });
-      const envNames = job.spec?.template?.spec?.containers[0]?.env?.map((e) => e.name) ?? [];
-      expect(envNames).toContain("ANTHROPIC_AUTH_TOKEN");
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
+      const authEntry = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "ANTHROPIC_AUTH_TOKEN");
+      expect(authEntry?.value).toBeUndefined();
+      expect(authEntry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.ANTHROPIC_AUTH_TOKEN).toBe("sk-test");
     });
+
 
     it("user env config overrides inherited env", () => {
       selfPod.inheritedEnv = { AWS_REGION: "us-east-1" };
@@ -718,11 +742,14 @@ describe("buildJobManifest", () => {
       expect(runId?.value).toBe("run-abc12345");
     });
 
-    it("sets PAPERCLIP_API_KEY from authToken", () => {
+    it("routes PAPERCLIP_API_KEY (from authToken) through a Secret instead of a literal value (BLO-17980)", () => {
       ctx.authToken = "pk_abc123";
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const apiKey = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "PAPERCLIP_API_KEY");
-      expect(apiKey?.value).toBe("pk_abc123");
+      expect(apiKey?.value).toBeUndefined();
+      expect(apiKey?.valueFrom?.secretKeyRef?.key).toBe("PAPERCLIP_API_KEY");
+      expect(apiKey?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.PAPERCLIP_API_KEY).toBe("pk_abc123");
     });
 
     it("inherited PAPERCLIP_API_URL from selfPod takes precedence", () => {
@@ -1402,15 +1429,16 @@ describe("per-agent mcp.json layering", () => {
   });
 
   it("does not inject --mcp-config when adapterConfig.mcpServers is empty", () => {
-    const { claudeArgs, job } = buildJobManifest({ ctx, selfPod });
+    const { claudeArgs, job, mcpConfigSecret } = buildJobManifest({ ctx, selfPod });
     expect(claudeArgs).not.toContain("--mcp-config");
     expect(claudeArgs).not.toContain("--strict-mcp-config");
     const init = job.spec!.template.spec!.initContainers![0];
     const initEnvNames = (init.env ?? []).map((e) => e.name);
     expect(initEnvNames).not.toContain("MCP_CONFIG");
+    expect(mcpConfigSecret).toBeNull();
   });
 
-  it("ships the shared baseline even when adapterConfig.mcpServers is empty", () => {
+  it("ships the shared baseline even when adapterConfig.mcpServers is empty, via a Secret-backed volume rather than a literal env var (BLO-17980)", () => {
     const dir = mkdtempSync(join(tmpdir(), "claude-k8s-mcp-"));
     const baselinePath = join(dir, ".mcp.json");
     try {
@@ -1427,27 +1455,39 @@ describe("per-agent mcp.json layering", () => {
       );
       process.env.PAPERCLIP_SHARED_MCP_BASELINE_PATH = baselinePath;
 
-      const { claudeArgs, job } = buildJobManifest({ ctx, selfPod });
+      const { claudeArgs, job, mcpConfigSecret } = buildJobManifest({ ctx, selfPod });
       expect(claudeArgs).toContain("--mcp-config");
       expect(claudeArgs).toContain("/tmp/prompt/mcp.json");
       expect(claudeArgs).toContain("--strict-mcp-config");
 
       const init = job.spec!.template.spec!.initContainers![0];
-      const mcpEnv = (init.env ?? []).find((e) => e.name === "MCP_CONFIG");
-      expect(mcpEnv).toBeDefined();
-      const parsed = JSON.parse(mcpEnv!.value!) as {
+      const initEnvNames = (init.env ?? []).map((e) => e.name);
+      expect(initEnvNames).not.toContain("MCP_CONFIG");
+
+      expect(mcpConfigSecret).not.toBeNull();
+      const parsed = JSON.parse(mcpConfigSecret!.data["mcp.json"]) as {
         mcpServers: Record<string, { command?: string; args?: string[] }>;
       };
       expect(parsed.mcpServers.paperclip).toEqual({
         command: "node",
         args: ["/app/packages/mcp-server/dist/stdio.js"],
       });
+
+      // The Secret is mounted read-only and copied into the shared prompt emptyDir
+      const volumes = job.spec!.template.spec!.volumes ?? [];
+      const secretVolume = volumes.find((v) => v.name === "mcp-config-secret");
+      expect(secretVolume?.secret?.secretName).toBe(mcpConfigSecret!.name);
+      const initMount = (init.volumeMounts ?? []).find((m) => m.name === "mcp-config-secret");
+      expect(initMount?.mountPath).toBe("/tmp/mcp-secret");
+      expect(initMount?.readOnly).toBe(true);
+      const initCmd = (init.command ?? []).join(" ");
+      expect(initCmd).toContain("cp /tmp/mcp-secret/mcp.json /tmp/prompt/mcp.json");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("merges per-agent overrides on top of the shared baseline and ships --mcp-config + --strict-mcp-config", () => {
+  it("merges per-agent overrides on top of the shared baseline and ships --mcp-config + --strict-mcp-config, staging mcp.json as a Secret instead of a literal env var (BLO-17980)", () => {
     ctx = makeCtx({
       config: {
         mcpServers: {
@@ -1462,15 +1502,17 @@ describe("per-agent mcp.json layering", () => {
         },
       },
     });
-    const { claudeArgs, job } = buildJobManifest({ ctx, selfPod });
+    const { claudeArgs, job, mcpConfigSecret } = buildJobManifest({ ctx, selfPod });
     expect(claudeArgs).toContain("--mcp-config");
     expect(claudeArgs).toContain("/tmp/prompt/mcp.json");
     expect(claudeArgs).toContain("--strict-mcp-config");
 
     const init = job.spec!.template.spec!.initContainers![0];
-    const mcpEnv = (init.env ?? []).find((e) => e.name === "MCP_CONFIG");
-    expect(mcpEnv).toBeDefined();
-    const parsed = JSON.parse(mcpEnv!.value!) as {
+    const initEnvNames = (init.env ?? []).map((e) => e.name);
+    expect(initEnvNames).not.toContain("MCP_CONFIG");
+
+    expect(mcpConfigSecret).not.toBeNull();
+    const parsed = JSON.parse(mcpConfigSecret!.data["mcp.json"]) as {
       mcpServers: Record<string, { type?: string; url?: string }>;
     };
     // Per-agent overrides land verbatim
@@ -1482,9 +1524,36 @@ describe("per-agent mcp.json layering", () => {
       type: "http",
       url: "http://figma-mcp-server.paperclip.svc.cluster.local:8080/mcp",
     });
-    // The init shell command writes the file to the prompt emptyDir
+    // The init shell command copies the file from the mounted Secret volume, never printf's a literal value
     const initCmd = (init.command ?? []).join(" ");
-    expect(initCmd).toContain('printf \'%s\' "$MCP_CONFIG" > /tmp/prompt/mcp.json');
+    expect(initCmd).toContain("cp /tmp/mcp-secret/mcp.json /tmp/prompt/mcp.json");
+    expect(initCmd).not.toContain("MCP_CONFIG");
+  });
+
+  it("never leaks an mcpServers Authorization header into any literal env value on any container (BLO-17980/BLO-17973 regression)", () => {
+    ctx = makeCtx({
+      config: {
+        mcpServers: {
+          gbrain: {
+            url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+            type: "http",
+            headers: { Authorization: "Bearer gbrain_at_test-token-should-never-leak" },
+          },
+        },
+      },
+    });
+    const { job, mcpConfigSecret } = buildJobManifest({ ctx, selfPod });
+    const allContainers = [
+      ...(job.spec!.template.spec!.initContainers ?? []),
+      ...job.spec!.template.spec!.containers,
+    ];
+    for (const c of allContainers) {
+      for (const e of c.env ?? []) {
+        expect(e.value ?? "").not.toContain("gbrain_at_test-token-should-never-leak");
+      }
+    }
+    // The header only lives in the Secret payload, never inline in the Job spec.
+    expect(mcpConfigSecret!.data["mcp.json"]).toContain("gbrain_at_test-token-should-never-leak");
   });
 });
 
@@ -1631,5 +1700,45 @@ describe("paperclipTaskMarkdown surfacing", () => {
     expect(result.promptMetrics.taskMarkdownChars).toBeGreaterThan(0);
     expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
     expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+});
+
+describe("fail-closed sensitive-env guard covers every container on the pod", () => {
+  // BLO-21593 review finding: the guard used to enumerate the envVars/initEnv
+  // locals, so the DinD sidecar — whose env is built inside buildDindSidecar()
+  // and never flows through those locals — silently bypassed it. These pin the
+  // check to the assembled pod spec instead.
+
+  it("flags a sensitive literal in a sidecar container, not just the main one", () => {
+    const podSpec = {
+      initContainers: [
+        { name: "write-prompt", env: [{ name: "PROMPT_FILE", value: "/tmp/p" }] },
+        { name: "dind", env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }, { name: "REGISTRY_TOKEN", value: "leaked" }] },
+      ],
+      containers: [{ name: "claude", env: [{ name: "AWS_REGION", value: "us-east-1" }] }],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+
+    // The old per-array check, applied to the main container's env only, sees nothing.
+    expect(findLiteralSensitiveEnvVars(podSpec.containers![0].env ?? [])).toEqual([]);
+    // The pod-spec-wide check catches it, and names the offending container.
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual(["dind/REGISTRY_TOKEN"]);
+  });
+
+  it("ignores the sidecar's non-sensitive literals", () => {
+    const podSpec = {
+      initContainers: [{ name: "dind", env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }] }],
+      containers: [{ name: "claude", env: [] }],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+  });
+
+  it("guards the DinD sidecar that buildJobManifest actually assembles", () => {
+    const ctx = makeCtx({ config: { enableDocker: true } });
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const podSpec = job.spec!.template.spec!;
+    // The sidecar is on the pod...
+    expect(podSpec.initContainers!.map((c) => c.name)).toContain("dind");
+    // ...and is inside the guard's field of view (it returns clean today).
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
   });
 });
