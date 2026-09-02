@@ -13,6 +13,8 @@ function isBedrockEnv(): boolean {
 }
 
 const DIRECT_MODELS: AdapterModel[] = [
+  { id: "claude-fable-5-1[1m]", label: "Claude Fable 5.1 (1M)" },
+  { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
   { id: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 (1M)" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
@@ -27,6 +29,7 @@ const DIRECT_MODELS: AdapterModel[] = [
 ];
 
 const BEDROCK_MODELS: AdapterModel[] = [
+  { id: "us.anthropic.claude-fable-5-1-v1", label: "Bedrock Fable 5.1" },
   { id: "us.anthropic.claude-opus-4-7", label: "Bedrock Opus 4.7" },
   { id: "us.anthropic.claude-opus-5", label: "Bedrock Opus 5" },
   { id: "us.anthropic.claude-sonnet-5", label: "Bedrock Sonnet 5" },
