@@ -340,6 +340,69 @@ function parseKeyValueConfig(raw: unknown): Record<string, string> {
   return result;
 }
 
+const SUPPORTED_PENSTOCK_PROVIDERS = new Set(["anthropic", "openai"]);
+const PONYTAIL_MODES = new Set(["off", "lite", "full", "ultra"]);
+
+export function validatePenstockProvider(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  const value = raw.trim().toLowerCase();
+  if (!SUPPORTED_PENSTOCK_PROVIDERS.has(value)) {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  return value;
+}
+
+/**
+ * Resolve a command that is inserted into the Job shell.  The value is an
+ * executable path/name, not a shell fragment: accepting whitespace or shell
+ * syntax here would turn an agent config field into command injection.
+ */
+export function validateAgentCommand(raw: unknown, fallback = "claude"): string {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw !== "string") throw new Error("agentCommand must name one executable");
+  const value = raw.trim();
+  if (!value) throw new Error("agentCommand must name one executable");
+  if (!/^[A-Za-z0-9._/-]+$/.test(value)) {
+    throw new Error("agentCommand must name one executable without arguments or shell metacharacters");
+  }
+  return value;
+}
+
+/** Validate a filesystem path used to load a Ponytail plugin. */
+export function validatePonytailPluginPath(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailPluginPath must be an absolute path");
+  const value = raw.trim();
+  if (!value || !path.posix.isAbsolute(value) || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("ponytailPluginPath must be an absolute path without control characters");
+  }
+  return value;
+}
+
+/** Validate the non-secret Ponytail intensity preference. */
+export function validatePonytailDefaultMode(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  const value = raw.trim().toLowerCase();
+  if (!PONYTAIL_MODES.has(value)) {
+    throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  }
+  return value;
+}
+
+function hasExplicitEnvName(
+  name: string,
+  envConfig: Record<string, unknown>,
+  inheritedEnv: Record<string, string>,
+  inheritedEnvValueFrom: k8s.V1EnvVar[],
+): boolean {
+  return Object.prototype.hasOwnProperty.call(envConfig, name) ||
+    Object.prototype.hasOwnProperty.call(inheritedEnv, name) ||
+    inheritedEnvValueFrom.some((entry) => entry.name === name);
+}
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
@@ -587,6 +650,31 @@ function buildEnvVars(
     if (typeof value === "string") merged[key] = value;
   }
 
+  const agentCommand = validateAgentCommand(config.agentCommand, "claude");
+  const usesExternalLauncher = agentCommand !== "claude";
+  if (usesExternalLauncher) {
+    // The launcher owns provider credentials and starts the native Claude
+    // protocol itself. Keep the contract explicit in the pod environment while
+    // leaving any operator-supplied values untouched.
+    if (!hasExplicitEnvName("PENSTOCK_AGENT_COMMAND", envConfig, selfPod.inheritedEnv, selfPod.inheritedEnvValueFrom)) {
+      merged.PENSTOCK_AGENT_COMMAND = "claude";
+    }
+    if (!hasExplicitEnvName("PENSTOCK_PROVIDER", envConfig, selfPod.inheritedEnv, selfPod.inheritedEnvValueFrom)) {
+      merged.PENSTOCK_PROVIDER = "anthropic";
+    } else if (Object.prototype.hasOwnProperty.call(merged, "PENSTOCK_PROVIDER")) {
+      // Validate only literals visible to the adapter. valueFrom-backed
+      // providers stay opaque and are validated by the runtime after resolution.
+      merged.PENSTOCK_PROVIDER = validatePenstockProvider(merged.PENSTOCK_PROVIDER);
+    }
+  }
+  const ponytailMode = validatePonytailDefaultMode(config.ponytailDefaultMode);
+  if (
+    ponytailMode &&
+    !hasExplicitEnvName("PONYTAIL_DEFAULT_MODE", envConfig, selfPod.inheritedEnv, selfPod.inheritedEnvValueFrom)
+  ) {
+    merged.PONYTAIL_DEFAULT_MODE = ponytailMode;
+  }
+
   // Per-agent Penstock session identity (org_penstock #accounts attribution).
   // Every agent Job shares the one org API key, so without a per-agent
   // client-session header the whole fleet melts into a single UNTAGGED bucket
@@ -771,6 +859,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // K8s Job pods are always unattended — no one to approve permission prompts
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const extraArgs = asStringArray(config.extraArgs);
+  const agentCommand = validateAgentCommand(config.agentCommand, "claude");
+  const usesExternalLauncher = agentCommand !== "claude";
+  const ponytailPluginPath = validatePonytailPluginPath(config.ponytailPluginPath);
+  const ponytailDefaultMode = validatePonytailDefaultMode(config.ponytailDefaultMode);
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const hasConfigKey = (key: string) => Object.prototype.hasOwnProperty.call(config, key);
@@ -901,6 +993,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // ns-rw replacing readonly, since the project-scope file would win.
     claudeArgs.push("--mcp-config", "/tmp/prompt/mcp.json", "--strict-mcp-config");
   }
+  if (ponytailPluginPath) claudeArgs.push("--plugin-dir", ponytailPluginPath);
   if (extraArgs.length > 0) claudeArgs.push(...extraArgs);
 
   // Build env vars. envSecretName is computed from jobName (already resolved
@@ -1081,7 +1174,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       )
     : [];
   const accountsArg = anthropicAccounts.length > 0 ? ` --accounts ${anthropicAccounts.join(",")}` : "";
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
+  const ccrotateRefresh = usesExternalLauncher
+    ? ""
+    : `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
   // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
   // `rate_limit_event` with `overageStatus:"rejected"` +
   // `overageDisabledReason:"out_of_credits"` was not a terminal signal to
@@ -1105,6 +1200,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
   const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const launcherCommand = agentCommand === "claude" ? "claude" : quoteShellArg(agentCommand);
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1124,7 +1220,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ].join(" ")
     : "";
   const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; ${preparePodLog}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

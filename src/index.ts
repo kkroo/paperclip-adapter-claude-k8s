@@ -50,9 +50,12 @@ Core fields:
 - model (string, optional): Claude model id
 - effort (string, optional): reasoning effort passed via --effort (low|medium|high)
 - maxTurnsPerRun (number, optional): max turns for one run
+- agentCommand (string, optional): one executable used to launch Claude; set this to the reviewed Caveman/Penstock launcher to route the run through Penstock. Arguments and shell metacharacters are rejected.
+- ponytailPluginPath (string, optional): absolute path to the installed Ponytail plugin directory; passed to Claude with --plugin-dir
+- ponytailDefaultMode (string, optional): Ponytail default mode (off|lite|full|ultra); an explicit PONYTAIL_DEFAULT_MODE env value wins
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file injected at runtime via --append-system-prompt-file
 - extraArgs (string[], optional): additional CLI args appended to the claude command
-- env (object, optional): KEY=VALUE environment variables; overrides inherited vars from the Deployment
+- env (object, optional): KEY=VALUE environment variables; overrides inherited vars from the Deployment. PENSTOCK_API_KEY must arrive through a Paperclip/Kubernetes Secret binding; do not place a raw credential in adapter configuration.
 
 Kubernetes fields:
 - namespace (string, optional): namespace for Jobs; defaults to the Deployment namespace
@@ -80,6 +83,7 @@ Notes:
 - Session resume works via the shared /paperclip PVC (HOME=/paperclip)
 - Skills are bundled in the container image
 - Prompts are delivered via a busybox init container writing to an emptyDir volume
+- The Caveman/Penstock launcher and Ponytail assets are not activated by this configuration alone. Verify executable availability, plugin assets, launcher readiness identity, and a non-production smoke run before any fleet rollout.
 `;
 
 export { createServerAdapter } from "./server/index.js";

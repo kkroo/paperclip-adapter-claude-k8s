@@ -11,6 +11,9 @@ import {
   isSensitiveEnvName,
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
+  validateAgentCommand,
+  validatePonytailPluginPath,
+  validatePonytailDefaultMode,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
@@ -477,6 +480,36 @@ describe("buildJobManifest", () => {
       ctx.context = { paperclipWorkspace: { cwd: "/workspace/myproject" } };
       const { job } = buildJobManifest({ ctx, selfPod });
       expect(job.spec?.template?.spec?.containers[0]?.workingDir).toBe("/workspace/myproject");
+    });
+
+    it("uses the validated external launcher and preserves native Claude args", () => {
+      ctx.config = { agentCommand: "/opt/penstock/bin/penstock-agent-runtime.mjs" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+      expect(command).toContain("'/opt/penstock/bin/penstock-agent-runtime.mjs' '--print'");
+      expect(command).not.toContain("ccrotate next");
+      expect(env.find((entry) => entry.name === "PENSTOCK_AGENT_COMMAND")?.value).toBe("claude");
+      expect(env.find((entry) => entry.name === "PENSTOCK_PROVIDER")?.value).toBe("anthropic");
+    });
+
+    it("preserves explicit launcher provider and Ponytail environment mode", () => {
+      ctx.config = {
+        agentCommand: "/opt/penstock/bin/penstock-agent-runtime.mjs",
+        ponytailDefaultMode: "lite",
+        env: { PENSTOCK_PROVIDER: "openai", PONYTAIL_DEFAULT_MODE: "ultra" },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+      expect(env.find((entry) => entry.name === "PENSTOCK_PROVIDER")?.value).toBe("openai");
+      expect(env.find((entry) => entry.name === "PONYTAIL_DEFAULT_MODE")?.value).toBe("ultra");
+    });
+
+    it("adds the Ponytail plugin directory to Claude args", () => {
+      ctx.config = { ponytailPluginPath: "/opt/penstock/ponytail" };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).toContain("--plugin-dir");
+      expect(claudeArgs).toContain("/opt/penstock/ponytail");
     });
   });
 

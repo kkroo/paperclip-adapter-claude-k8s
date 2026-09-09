@@ -34,6 +34,30 @@ export function getConfigSchema(): AdapterConfigSchema {
       hint: "Maximum number of agentic turns (tool calls) per heartbeat run. 0 means unlimited.",
       default: 1000,
     },
+    {
+      type: "text",
+      key: "agentCommand",
+      label: "Agent Launcher",
+      hint: "Optional executable used to launch Claude. Set this to the reviewed Caveman/Penstock launcher path; arguments and shell syntax are rejected.",
+    },
+    {
+      type: "text",
+      key: "ponytailPluginPath",
+      label: "Ponytail Plugin Path",
+      hint: "Absolute path to the installed Ponytail plugin directory. The path is passed to Claude with --plugin-dir.",
+    },
+    {
+      type: "select",
+      key: "ponytailDefaultMode",
+      label: "Ponytail Default Mode",
+      hint: "Default Ponytail intensity for this agent. An explicit PONYTAIL_DEFAULT_MODE in env takes precedence.",
+      options: [
+        { value: "off", label: "Off" },
+        { value: "lite", label: "Lite" },
+        { value: "full", label: "Full" },
+        { value: "ultra", label: "Ultra" },
+      ],
+    },
     // Kubernetes
     {
       type: "text",

@@ -48,6 +48,20 @@ describe("getConfigSchema", () => {
     expect(field!.default).toBe(true);
   });
 
+  it("exposes the Caveman and Ponytail fields", () => {
+    const schema = getConfigSchema();
+    const fields = new Map(schema.fields.map((field: ConfigFieldSchema) => [field.key, field]));
+    expect(fields.get("agentCommand")?.type).toBe("text");
+    expect(fields.get("ponytailPluginPath")?.type).toBe("text");
+    expect(fields.get("ponytailDefaultMode")?.type).toBe("select");
+    expect(fields.get("ponytailDefaultMode")?.options).toEqual([
+      { value: "off", label: "Off" },
+      { value: "lite", label: "Lite" },
+      { value: "full", label: "Full" },
+      { value: "ultra", label: "Ultra" },
+    ]);
+  });
+
   it("has imagePullPolicy as select with correct options", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "imagePullPolicy");

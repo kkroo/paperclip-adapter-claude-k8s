@@ -109,10 +109,10 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["get"]
 
-  # Secret health check — verify API key secret exists
+  # Verify configured secrets; create/delete per-run Secrets and patch owner references
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get"]
+    verbs: ["create", "delete", "get", "patch"]
 
   # RBAC self-test — adapter validates its own permissions at startup
   - apiGroups: ["authorization.k8s.io"]
@@ -222,6 +222,9 @@ Agent-level configuration fields set in `adapterConfig`:
 | `model` | string | — | Claude model id (e.g., `claude-sonnet-5`) |
 | `effort` | string | — | Reasoning effort: `low`, `medium`, or `high` |
 | `maxTurnsPerRun` | number | 0 | Max turns per run (0 = unlimited) |
+| `agentCommand` | string | `claude` | One executable used to launch Claude; set to the reviewed Penstock runtime to route through Caveman |
+| `ponytailPluginPath` | string | — | Absolute path to the installed Ponytail plugin directory; passed with `--plugin-dir` |
+| `ponytailDefaultMode` | string | — | `off`, `lite`, `full`, or `ultra`; explicit `PONYTAIL_DEFAULT_MODE` takes precedence |
 | `dangerouslySkipPermissions` | boolean | `true` | Skip permission prompts (required for unattended Jobs) |
 | `instructionsFilePath` | string | — | Path to a markdown instructions file on the shared PVC |
 | `extraArgs` | string[] | `[]` | Additional CLI args appended to the `claude` command |
@@ -259,6 +262,12 @@ Default resource requests/limits:
 | `timeoutSec` | number | 0 | Run timeout in seconds (0 = no timeout) |
 | `graceSec` | number | 60 | Grace period after Job deadline before the adapter gives up |
 
+Credential-shaped literal environment values are placed in a per-run Kubernetes
+Secret and referenced from the Job with `secretKeyRef`. Keep Penstock and
+provider credentials in Paperclip/Kubernetes Secret bindings rather than source,
+adapter metadata, or comments. External launcher mode leaves Claude's own
+credential files untouched because the configured launcher owns authentication.
+
 ### Inherited from the Deployment (no config needed)
 
 The adapter auto-discovers these from the running Paperclip pod:
@@ -287,6 +296,20 @@ The adapter auto-discovers these from the running Paperclip pod:
 5. **Result parsing** — When the Job completes, Claude's stream-json output is parsed to extract session IDs, token usage, cost, and the result summary.
 
 6. **Cleanup** — Completed Jobs are deleted automatically (unless `retainJobs` is set).
+
+### Caveman and Ponytail
+
+Set `agentCommand` to the absolute path of the reviewed Penstock runtime (for
+example `/opt/penstock/bin/penstock-agent-runtime.mjs`). The adapter passes
+native Claude arguments after that executable, sets
+`PENSTOCK_AGENT_COMMAND=claude`, and defaults `PENSTOCK_PROVIDER=anthropic`;
+explicit provider environment values win. `ponytailPluginPath` points at the
+installed Ponytail plugin directory (for example `/opt/penstock/ponytail`) and
+is passed to Claude as `--plugin-dir`.
+
+This wiring does not install either asset or claim that a Paperclip image ships
+them. Verify the runtime and plugin paths in the exact Job image, then run one
+non-production smoke task before enabling heartbeats.
 
 ## License
 
