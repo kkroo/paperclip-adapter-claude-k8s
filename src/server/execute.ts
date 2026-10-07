@@ -1462,6 +1462,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         commandArgs: claudeArgs,
         commandNotes: [
           `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
+          `Claude Code: ${built.claudeCodeVersion ? `${built.claudeCodeVersion} (adapter-managed on the data PVC)` : "bundled in the image"}`,
           `Namespace: ${namespace}`,
           `ServiceAccount: ${built.serviceAccountName}`,
           `Timeout: ${timeoutSec}s`,
