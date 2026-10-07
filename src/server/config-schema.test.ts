@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { getConfigSchema } from "./config-schema.js";
+import { DEFAULT_CLAUDE_CODE_VERSION } from "./runtime-pin.js";
 
 interface ConfigFieldSchema {
   key: string;
@@ -24,6 +25,14 @@ describe("getConfigSchema", () => {
     expect(keys).not.toContain("instructionsFilePath");
     expect(keys).not.toContain("timeoutSec");
     expect(keys).not.toContain("graceSec");
+  });
+
+  it("exposes claudeCodeVersion defaulting to the adapter pin", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "claudeCodeVersion");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("text");
+    expect(field!.default).toBe(DEFAULT_CLAUDE_CODE_VERSION);
   });
 
   it("maxTurnsPerRun defaults to 1000", () => {

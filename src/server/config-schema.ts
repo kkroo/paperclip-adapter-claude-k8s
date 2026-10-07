@@ -4,6 +4,8 @@
 // used at build time here. The Paperclip types in @paperclipai/adapter-utils
 // may lag behind; these locals are the source of truth for this adapter.
 
+import { DEFAULT_CLAUDE_CODE_VERSION } from "./runtime-pin.js";
+
 interface ConfigFieldOption {
   label: string;
   value: string;
@@ -63,6 +65,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         { value: "Always", label: "Always" },
         { value: "Never", label: "Never" },
       ],
+    },
+    {
+      type: "text",
+      key: "claudeCodeVersion",
+      label: "Claude Code Version",
+      hint: `Exact @anthropic-ai/claude-code version the Job installs once onto the shared data PVC and runs instead of the image's bundled CLI (default ${DEFAULT_CLAUDE_CODE_VERSION}). Set to "image" to run the CLI bundled in the container image. New Claude models require a minimum CLI version; the image's copy only changes on an image rebuild.`,
+      default: DEFAULT_CLAUDE_CODE_VERSION,
     },
     {
       type: "text",

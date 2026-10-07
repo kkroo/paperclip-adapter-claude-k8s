@@ -233,6 +233,7 @@ Agent-level configuration fields set in `adapterConfig`:
 |-------|------|---------|-------------|
 | `namespace` | string | Deployment ns | Namespace for Job pods |
 | `image` | string | Deployment image | Override container image |
+| `claudeCodeVersion` | string | `2.1.292` | Exact `@anthropic-ai/claude-code` version Job pods install once onto the data PVC and run (`"image"` = use the CLI bundled in the container image) |
 | `imagePullPolicy` | string | `IfNotPresent` | Image pull policy |
 | `kubeconfig` | string | — | Path to kubeconfig (defaults to in-cluster auth) |
 | `serviceAccountName` | string | — | Service account for Job pods |

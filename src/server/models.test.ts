@@ -22,6 +22,9 @@ describe("listK8sModels", () => {
     const models = await listK8sModels();
     expect(models.some((m) => m.id === "claude-opus-5")).toBe(true);
     expect(models.some((m) => m.id === "claude-opus-5[1m]")).toBe(true);
+    expect(models.some((m) => m.id === "claude-opus-5-5[1m]")).toBe(true);
+    expect(models.some((m) => m.id === "claude-sonnet-5-5[1m]")).toBe(true);
+    expect(models.some((m) => m.id === "claude-opus-5[1m]")).toBe(true);
     expect(models.some((m) => m.id === "claude-opus-4-8[1m]")).toBe(true);
     expect(models.some((m) => m.id === "claude-sonnet-5")).toBe(true);
     expect(models.some((m) => m.id === "claude-sonnet-4-6[1m]")).toBe(true);

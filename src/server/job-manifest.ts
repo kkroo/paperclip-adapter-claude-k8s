@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
+import { buildClaudeCodeRuntimeShell, resolveClaudeCodeVersion } from "./runtime-pin.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -458,6 +459,9 @@ export interface JobBuildResult {
   /** Resolved ServiceAccount for the Job's pod template — echoed here so
    *  callers can log/report it without a cluster read (BLO-21812). */
   serviceAccountName: string;
+  /** Pinned Claude Code version the Job bootstraps onto the data PVC, or ""
+   *  when adapterConfig.claudeCodeVersion is "image" (use the bundled CLI). */
+  claudeCodeVersion: string;
 }
 
 function sanitizeForK8sName(value: string, maxLen = 16): string {
@@ -761,6 +765,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const serviceAccountName = resolveServiceAccountName(config);
   const image = asString(config.image, "") || selfPod.image;
+  // Throws on anything but an exact version or "image" — the value is shell-interpolated.
+  const claudeCodeVersion = resolveClaudeCodeVersion(config.claudeCodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
   const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
@@ -1124,7 +1130,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ].join(" ")
     : "";
   const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; ${preparePodLog}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  // Adapter-managed Claude Code runtime (see runtime-pin.ts). Runs before the
+  // ccrotate preflight so a slow first install cannot age the freshly rotated
+  // OAuth token, and after the env guard so the hook install is unaffected.
+  // Empty when claudeCodeVersion is "image": the pipeline is then byte-identical
+  // to the pre-pin command and `claude` resolves to the image's bundled CLI.
+  const claudeRuntime = claudeCodeVersion
+    ? `${buildClaudeCodeRuntimeShell({ version: claudeCodeVersion, dataMountPath })}; `
+    : "";
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh}; ${preparePodLog}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -1330,5 +1344,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     skippedLabels,
     podLogPath,
     serviceAccountName,
+    claudeCodeVersion,
   };
 }
