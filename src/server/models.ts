@@ -1,6 +1,12 @@
 import type { AdapterModel } from "@paperclipai/adapter-utils";
 
 const DIRECT_MODELS: AdapterModel[] = [
+  { id: "claude-opus-5-5[1m]", label: "Claude Opus 5.5 (1M)" },
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+  { id: "claude-sonnet-5-5[1m]", label: "Claude Sonnet 5.5 (1M)" },
+  { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+  { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
+  { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 (1M)" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },

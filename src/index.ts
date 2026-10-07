@@ -13,6 +13,12 @@ function isBedrockEnv(): boolean {
 }
 
 const DIRECT_MODELS: AdapterModel[] = [
+  { id: "claude-opus-5-5[1m]", label: "Claude Opus 5.5 (1M)" },
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+  { id: "claude-sonnet-5-5[1m]", label: "Claude Sonnet 5.5 (1M)" },
+  { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+  { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
+  { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 (1M)" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
@@ -57,6 +63,7 @@ Core fields:
 Kubernetes fields:
 - namespace (string, optional): namespace for Jobs; defaults to the Deployment namespace
 - image (string, optional): override container image; defaults to the running Deployment image
+- claudeCodeVersion (string, optional): exact @anthropic-ai/claude-code version installed once onto the data PVC and used by Job pods; default 2.1.292; "image" runs the CLI bundled in the container image
 - imagePullPolicy (string, optional): image pull policy; default "IfNotPresent"
 - kubeconfig (string, optional): absolute path to a kubeconfig file on disk; defaults to in-cluster service account auth
 - resources (object, optional): { requests: { cpu, memory }, limits: { cpu, memory } }
@@ -79,6 +86,7 @@ Inherited from Deployment (no config needed):
 Notes:
 - Session resume works via the shared /paperclip PVC (HOME=/paperclip)
 - Skills are bundled in the container image
+- The Claude Code CLI is adapter-managed: Job pods install the pinned version under <data PVC>/.local/lib/paperclip-k8s-runtimes/claude-code/<version> on first use and fall back to the image's bundled CLI if that install cannot complete
 - Prompts are delivered via a busybox init container writing to an emptyDir volume
 `;
 
