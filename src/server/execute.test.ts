@@ -1151,6 +1151,38 @@ describe("execute: job creation", () => {
     expect(mockBatchDeleteJob).toHaveBeenCalled();
   });
 
+  it("stages large prompts through the host runtime API before creating a Job", async () => {
+    const stageRuntimePrompt = vi.fn().mockResolvedValue("/api/heartbeat-runs/run-test-001/runtime-prompt");
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-stage" },
+        status: {
+          phase: "Pending",
+          conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "no nodes available" }],
+          containerStatuses: [],
+          initContainerStatuses: [],
+        },
+      }],
+    });
+    const result = await execute(makeCtx({
+      authToken: "signed-run-token",
+      stageRuntimePrompt,
+    } as Partial<AdapterExecutionContext>));
+    expect(stageRuntimePrompt).toHaveBeenCalledWith(expect.any(String));
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  it("returns a create failure when host prompt staging is unavailable", async () => {
+    const stageRuntimePrompt = vi.fn().mockRejectedValue(new Error("host unavailable"));
+    const result = await execute(makeCtx({ stageRuntimePrompt } as Partial<AdapterExecutionContext>));
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toBe("Failed to prepare the runtime prompt download");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+
+  });
+
   it("returns k8s_pod_schedule_failed when pod scheduling times out", async () => {
     mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "uid-1" } });
     mockBatchDeleteJob.mockResolvedValue({});
