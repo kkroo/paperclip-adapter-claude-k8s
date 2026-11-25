@@ -263,6 +263,50 @@ function resolveResumableClaudeSessionId(input: {
   );
   return existsSync(sessionFile) ? sessionId : "";
 }
+const RUNTIME_PROMPT_TOKEN = "PAPERCLIP_RUNTIME_PROMPT_TOKEN";
+const DOWNLOAD_RUNTIME_PROMPT = `
+const { createWriteStream, existsSync, rmSync, writeFileSync, copyFileSync } = require("node:fs");
+const { Readable, Transform } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
+const { setTimeout: delay } = require("node:timers/promises");
+async function download() {
+  const maxBytes = 16 * 1024 * 1024;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(process.env.PAPERCLIP_RUNTIME_PROMPT_URL, {
+        headers: { Authorization: "Bearer " + process.env.PAPERCLIP_RUNTIME_PROMPT_TOKEN },
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (response.status !== 200 || !response.body || !response.headers.get("content-type")?.startsWith("text/plain")) {
+        await response.body?.cancel();
+        if (response.status < 500 && response.status !== 429) process.exitCode = 1;
+        else throw new Error("Prompt endpoint temporarily unavailable");
+        return;
+      }
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > maxBytes) throw new Error("Prompt response exceeds the runtime limit");
+      let bytes = 0;
+      const bounded = new Transform({
+        transform(chunk, _encoding, callback) {
+          bytes += chunk.length;
+          callback(bytes > maxBytes ? new Error("Prompt response exceeds the runtime limit") : null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream("/tmp/prompt/prompt.txt", { mode: 0o600 }));
+      if (process.env.MCP_CONFIG) writeFileSync("/tmp/prompt/mcp.json", process.env.MCP_CONFIG, { mode: 0o600 });
+      if (existsSync("/tmp/mcp-secret/mcp.json")) copyFileSync("/tmp/mcp-secret/mcp.json", "/tmp/prompt/mcp.json");
+      return;
+    } catch {
+      rmSync("/tmp/prompt/prompt.txt", { force: true });
+      if (attempt < 2) await delay(1000 * (attempt + 1));
+    }
+  }
+  process.exitCode = 1;
+}
+void download();
+`;
+
 
 // Inline prompt assembly — these functions are not yet in the published adapter-utils
 function joinPromptSections(sections: string[], separator = "\n\n"): string {
@@ -346,6 +390,8 @@ export interface JobBuildInput {
   selfPod: SelfPodInfo;
   /** Prepared prompt bundle (skills + instructions). When provided, --add-dir and --append-system-prompt-file use bundle paths. */
   promptBundle?: ClaudePromptBundle | null;
+  /** Private run prompt staged by the Paperclip host before this Job is created. */
+  runtimePromptPath?: string;
 }
 
 /** When the prompt exceeds the env-var size limit, the manifest uses a
@@ -757,7 +803,7 @@ export function resolveServiceAccountName(config: Record<string, unknown>): stri
 }
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
-  const { ctx, selfPod, promptBundle } = input;
+  const { ctx, selfPod, promptBundle, runtimePromptPath } = input;
   const { runId, agent, runtime, config: rawConfig, context } = ctx;
   const config = parseObject(rawConfig);
 
@@ -913,6 +959,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // above) so sensitive-named vars can be wired to secretKeyRef in one pass.
   const envSecretName = `${jobName}-env`;
   const { envVars, sensitiveEnvData } = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
+  if (runtimePromptPath && ctx.authToken) {
+    sensitiveEnvData[RUNTIME_PROMPT_TOKEN] = ctx.authToken;
+    envVars.push({
+      name: RUNTIME_PROMPT_TOKEN,
+      valueFrom: { secretKeyRef: { name: envSecretName, key: RUNTIME_PROMPT_TOKEN } },
+    });
+  }
   const envSecret: EnvSecret | null =
     Object.keys(sensitiveEnvData).length > 0 ? { name: envSecretName, namespace, data: sensitiveEnvData } : null;
 
@@ -1159,7 +1212,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Decide prompt delivery strategy: env var (small) or Secret volume (large).
   const promptBytes = Buffer.byteLength(prompt, "utf-8");
-  const useLargePromptPath = promptBytes > LARGE_PROMPT_THRESHOLD_BYTES;
+  let runtimePromptUrl: string | undefined;
+  if (runtimePromptPath) {
+    const base = new URL(selfPod.inheritedEnv.PAPERCLIP_API_URL || process.env.PAPERCLIP_API_URL || "");
+    const expectedPath = `/api/heartbeat-runs/${encodeURIComponent(runId)}/runtime-prompt`;
+    if (runtimePromptPath !== expectedPath || !["http:", "https:"].includes(base.protocol) ||
+        base.username || base.password || !ctx.authToken) {
+      throw new Error("Runtime prompt download requires the Paperclip API origin and a run token");
+    }
+    runtimePromptUrl = new URL(base.pathname.replace(/\/+$/, "") + expectedPath, base).href;
+  }
+  const useLargePromptPath = !runtimePromptUrl && promptBytes > LARGE_PROMPT_THRESHOLD_BYTES;
   let promptSecret: PromptSecret | null = null;
   const promptSecretName = `${jobName}-prompt`;
 
@@ -1180,16 +1243,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build the init container — writes the prompt (always) and, when an
   // agent supplied adapterConfig.mcpServers, the merged mcp.json next to
-  // it in the same prompt emptyDir. mcp.json routinely embeds MCP server
-  // credentials (e.g. an HTTP-transport server's `Authorization` header,
-  // or stdio server env) supplied via adapterConfig.mcpServers, so — unlike
-  // the prompt, which only goes Secret-backed above a size threshold —
-  // mcp.json is ALWAYS staged as a Secret-backed volume, never a literal
-  // init-container env var, regardless of size (BLO-17980/BLO-17973).
-  const initCommandParts = useLargePromptPath
+  // it in the same prompt emptyDir. mcp.json is small (~few kB) so the
+  // env-var path is fine even when the prompt itself goes the
+  // Secret-volume route for size.
+  const initCommandParts = runtimePromptUrl
+    ? []
+    : useLargePromptPath
+
     ? ["cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"]
     : [`printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`];
-  const initEnv: k8s.V1EnvVar[] = useLargePromptPath
+  const initEnv: k8s.V1EnvVar[] = runtimePromptUrl
+    ? [
+        { name: "PAPERCLIP_RUNTIME_PROMPT_URL", value: runtimePromptUrl },
+        { name: RUNTIME_PROMPT_TOKEN, valueFrom: { secretKeyRef: { name: envSecretName, key: RUNTIME_PROMPT_TOKEN } } },
+      ]
+    : useLargePromptPath
     ? []
     : [{ name: "PROMPT_CONTENT", value: prompt }];
   let mcpConfigSecret: McpConfigSecret | null = null;
@@ -1253,9 +1321,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   }
   const initContainer: k8s.V1Container = {
     name: "write-prompt",
-    image: "busybox:1.36",
+    image: runtimePromptUrl ? selfPod.image : "busybox:1.36",
     imagePullPolicy: "IfNotPresent",
-    command: ["sh", "-c", initCommandParts.join("; ")],
+    command: runtimePromptUrl
+      ? ["node", "-e", DOWNLOAD_RUNTIME_PROMPT]
+      : ["sh", "-c", initCommandParts.join("; ")],
     ...(initEnv.length > 0 ? { env: initEnv } : {}),
     volumeMounts: initVolumeMounts,
     securityContext,

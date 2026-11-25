@@ -1227,6 +1227,31 @@ describe("buildJobManifest", () => {
   });
 
   describe("large prompt Secret fallback", () => {
+    it("downloads the rendered prompt from the Paperclip runtime API when staged", () => {
+      const ctxWithToken = { ...ctx, authToken: "signed-run-token" };
+      const selfPodWithApi = { ...selfPod, inheritedEnv: { PAPERCLIP_API_URL: "https://paperclip.example" } };
+      const result = buildJobManifest({
+        ctx: ctxWithToken,
+        selfPod: selfPodWithApi,
+        runtimePromptPath: `/api/heartbeat-runs/${ctx.runId}/runtime-prompt`,
+      });
+      const init = result.job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.image).toBe(selfPod.image);
+      expect(init?.command?.[0]).toBe("node");
+      expect(init?.env).toContainEqual({
+        name: "PAPERCLIP_RUNTIME_PROMPT_URL",
+        value: `https://paperclip.example/api/heartbeat-runs/${ctx.runId}/runtime-prompt`,
+      });
+      expect(init?.env).toContainEqual({
+        name: "PAPERCLIP_RUNTIME_PROMPT_TOKEN",
+        valueFrom: {
+          secretKeyRef: { name: result.envSecret?.name, key: "PAPERCLIP_RUNTIME_PROMPT_TOKEN" },
+        },
+      });
+      expect(result.promptSecret).toBeNull();
+      expect(JSON.stringify(result.job)).not.toContain(result.prompt);
+    });
+
     it("returns null promptSecret for small prompts", () => {
       const { promptSecret } = buildJobManifest({ ctx, selfPod });
       expect(promptSecret).toBeNull();
